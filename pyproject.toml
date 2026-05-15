@@ -1,0 +1,19 @@
+[project]
+name = "obsidianagent"
+version = "0.1.0"
+description = "Dedalus-powered agent for Obsidian vault management via CLI"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dedalus-labs",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+    "rich>=13.0.0",
+    "numpy>=1.26.0",
+    "sounddevice>=0.5.0",
+    "prompt-toolkit>=3.0.0",
+    "pillow>=10.0.0",
+    "youtube-transcript-api>=1.2.0",
+    "yt-dlp>=2024.0.0",
+]
