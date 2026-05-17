@@ -20,7 +20,7 @@ from pathlib import Path
 from prompt_toolkit import Application, PromptSession
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout, Window, FormattedTextControl
+from prompt_toolkit.layout import FormattedTextControl, Layout, Window
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from rich import box
@@ -32,8 +32,8 @@ from rich.text import Text
 
 from .config import _ensure_vault_path
 from .orchestrator import (
-    mind_map_generate,
     fast_research_orchestration,
+    mind_map_generate,
     transcribe_orchestration,
 )
 from .pipelines import (
@@ -79,26 +79,27 @@ async def _confirm(text: str, default: bool = False) -> bool:
 
 
 MAIN_OPTIONS = [
-    ("Transcribe", "#674be2"),
-    ("Fast Research", "#674be2"),
-    ("Deep Research", "#674be2"),
-    ("Create Mind Map", "#674be2"),
-    ("Exit", "#674be2"),
+    "Transcribe",
+    "Fast Research",
+    "Deep Research",
+    "Create Mind Map",
+    "Exit",
 ]
 
 TRANSCRIBE_OPTIONS = [
-    ("From File", "#674be2"),
-    ("From YouTube", "#674be2"),
-    ("Live Recording", "#674be2"),
-    ("Back", "dim #674be2"),
+    "From File",
+    "From YouTube",
+    "Live Recording",
+    "Back",
 ]
 
-MENU_STYLE = Style.from_dict({
-    "title": "bold #a391ed",
-    "selected": "bold reverse #a391ed",
-    "normal": "#a391ed",
-    "border": "#a391ed",
-})
+MENU_STYLE = Style.from_dict(
+    {
+        "title": "bold #a391ed",
+        "selected": "bold reverse #a391ed",
+        "normal": "#a391ed",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +189,9 @@ def format_progress_report(result, title: str) -> None:
     steps = getattr(result, "steps_used", 0)
     msgs = len(getattr(result, "messages", []))
 
-    console.print(f"\n[bold #674be2]{title}[/bold #674be2]  [dim]({steps} steps, {msgs} msgs)[/dim]")
+    console.print(
+        f"\n[bold #674be2]{title}[/bold #674be2]  [dim]({steps} steps, {msgs} msgs)[/dim]"
+    )
 
     tools_called = getattr(result, "tools_called", [])
     tool_results = getattr(result, "tool_results", [])
@@ -209,7 +212,9 @@ def format_progress_report(result, title: str) -> None:
 
         icon, summary = _summarize_tool_result(name, best_result)
         count_suffix = f" ({counts[name]}×)" if counts[name] > 1 else ""
-        console.print(f"  {icon}  [#f0edfc]{name}[/#f0edfc]{count_suffix}  →  {summary}")
+        console.print(
+            f"  {icon}  [#f0edfc]{name}[/#f0edfc]{count_suffix}  →  {summary}"
+        )
 
     if result.final_output and not str(result.final_output).strip().startswith("{"):
         out = str(result.final_output).strip()
@@ -260,7 +265,7 @@ def _purple_gradient_text(text: str) -> Text:
     return result
 
 
-def _header(vault_path: str = ""):
+def _header():
     title = _purple_gradient_text("◆ OBSIDIAN AGENT ◆")
     console.print(
         Panel.fit(
@@ -270,8 +275,6 @@ def _header(vault_path: str = ""):
             box=box.DOUBLE,
         )
     )
-    if vault_path:
-        console.print(Text(f"📁{vault_path}", style="bold #674be2"))
 
 
 def _pause():
@@ -296,18 +299,19 @@ def _show_goodbye():
     sys.exit(0)
 
 
-async def _menu(title: str, options: list[tuple[str, str]]) -> int:
+async def _menu(title: str, options: list[str], vault_path: str = "") -> int:
     """Arrow-key menu. Returns selected index."""
     selected = 0
 
     def get_text():
-        lines = [("class:title", f"  🎯 {title}\n")]
-        for i, (opt, color) in enumerate(options):
+        lines = []
+        if vault_path:
+            lines.append(("class:normal", f"  📁 {vault_path}\n"))
+        lines.append(("class:title", f"  🎯 {title}\n"))
+        for i, opt in enumerate(options):
             prefix = "▸" if i == selected else " "
-            if i == selected:
-                lines.append(("class:selected", f" {prefix} {opt}\n"))
-            else:
-                lines.append(("class:normal", f" {prefix} {opt}\n"))
+            style = "class:selected" if i == selected else "class:normal"
+            lines.append((style, f" {prefix} {opt}\n"))
         lines.append(("class:normal", "\n  [Ctrl+B = Back | Ctrl+C = Quit]\n"))
         return lines
 
@@ -375,6 +379,7 @@ async def _process_transcript(transcript: str, source_info: str = ""):
 
     try:
         from .orchestrator.transcription import TRANSCRIBE
+
         messages = [{"role": "user", "content": content}]
         with _thinking_status(f"{TRANSCRIBE.name} working..."):
             result = await transcribe_orchestration(messages)
@@ -388,7 +393,9 @@ async def _process_transcript(transcript: str, source_info: str = ""):
 async def _transcribe_file():
     _clear()
     _header()
-    console.print(Panel("🎙 Transcribe from File", border_style="#674be2", box=box.ROUNDED))
+    console.print(
+        Panel("🎙 Transcribe from File", border_style="#674be2", box=box.ROUNDED)
+    )
 
     path = (await _prompt()).strip()
     if not path:
@@ -414,7 +421,9 @@ async def _transcribe_file():
 async def _transcribe_youtube():
     _clear()
     _header()
-    console.print(Panel("📺 Transcribe from YouTube", border_style="#674be2", box=box.ROUNDED))
+    console.print(
+        Panel("📺 Transcribe from YouTube", border_style="#674be2", box=box.ROUNDED)
+    )
 
     url = (await _prompt()).strip()
     if not url:
@@ -457,6 +466,7 @@ async def _transcribe_live():
         """Cross-platform async Enter detection that doesn't fight rich.Live."""
         if sys.platform == "win32":
             import msvcrt
+
             while not stop_event.is_set():
                 await asyncio.sleep(0.05)
                 if msvcrt.kbhit():
@@ -466,6 +476,7 @@ async def _transcribe_live():
                         return
         else:
             import select
+
             loop = asyncio.get_running_loop()
             while not stop_event.is_set():
                 ready, _, _ = await loop.run_in_executor(
@@ -507,8 +518,10 @@ async def _transcribe_live():
         rec_text = Text("🔴 REC", style=rec_style)
 
         content = Text.assemble(
-            rec_text, "\n\n",
-            time_text, "\n\n",
+            rec_text,
+            "\n\n",
+            time_text,
+            "\n\n",
             Text("Press Enter to stop", style="dim #674be2"),
         )
 
@@ -566,9 +579,10 @@ async def _transcribe_live():
 
 async def _fast_research():
     from .orchestrator.fast_research import GENERATE_NOTE
+
     _clear()
     _header()
-    console.print(Panel(" Fast Research", border_style="#674be2", box=box.ROUNDED))
+    console.print(Panel("⚡ Fast Research", border_style="#674be2", box=box.ROUNDED))
 
     topic = (await _prompt()).strip()
     if not topic:
@@ -590,11 +604,12 @@ async def _fast_research():
 
 async def _deep_research():
     from .orchestrator.deep_research import (
-        DR_PLANNER,
         DR_EXECUTOR,
-        deep_research_plan,
+        DR_PLANNER,
         deep_research_execute,
+        deep_research_plan,
     )
+
     _clear()
     _header()
     console.print(Panel("🎓 Deep Research", border_style="#674be2", box=box.ROUNDED))
@@ -627,7 +642,9 @@ async def _deep_research():
         console.print(f"[bold #f6f4fd]✗ {error}[/bold #f6f4fd]")
         if plan_result := plan_data.get("plan_result"):
             console.print("[dim]> Planner output:[/dim]")
-            console.print(str(getattr(plan_result, "final_output", "(no output)")[:800]))
+            console.print(
+                str(getattr(plan_result, "final_output", "(no output)")[:800])
+            )
         _pause()
         return
 
@@ -663,6 +680,7 @@ async def _deep_research():
 
 async def _create_mind_map():
     from .orchestrator.mind_map import MIND_MAP_AGENT
+
     _clear()
     _header()
     console.print(Panel("🧠 Create Mind Map", border_style="#674be2", box=box.ROUNDED))
@@ -705,7 +723,9 @@ async def _create_mind_map():
         _pause()
         return
 
-    console.print(f"[#674be2]> Creating mind map from:[/#674be2] [#674be2]{file_path.name}[/#674be2]")
+    console.print(
+        f"[#674be2]> Creating mind map from:[/#674be2] [#674be2]{file_path.name}[/#674be2]"
+    )
 
     # One-shot mind map generation with research
     console.print("[dim]> Researching topic and building mind map...[/dim]")
@@ -727,10 +747,14 @@ async def _create_mind_map():
     if error:
         console.print(f"[bold #a391ed]⚠ {error}[/bold #a391ed]")
     elif mind_map_path:
-        console.print(f"[bold #7f67e7]✓ Mind map created: {mind_map_path}[/bold #7f67e7]")
+        console.print(
+            f"[bold #7f67e7]✓ Mind map created: {mind_map_path}[/bold #7f67e7]"
+        )
 
     if note_refined:
-        console.print(f"[bold #7f67e7]✓ Note refined with sources & learning path[/bold #7f67e7]")
+        console.print(
+            f"[bold #7f67e7]✓ Note refined with sources & learning path[/bold #7f67e7]"
+        )
 
     if sources:
         console.print(f"\n[bold #674be2]📚 Sources Found:[/bold #674be2]")
@@ -759,8 +783,8 @@ async def run_tui():
 
     async def _transcribe_menu():
         _clear()
-        _header(vault_path)
-        sub = await _menu("Transcribe", TRANSCRIBE_OPTIONS)
+        _header()
+        sub = await _menu("Transcribe", TRANSCRIBE_OPTIONS, vault_path=vault_path)
         if sub == -1:
             return
         handlers = [_transcribe_file, _transcribe_youtube, _transcribe_live, _noop]
@@ -783,9 +807,11 @@ async def run_tui():
     try:
         while True:
             _clear()
-            _header(vault_path)
+            _header()
 
-            choice = await _menu("What would you like to do?", MAIN_OPTIONS)
+            choice = await _menu(
+                "What would you like to do?", MAIN_OPTIONS, vault_path=vault_path
+            )
             if choice == -1:
                 continue
             if 0 <= choice < len(handlers):
