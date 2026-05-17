@@ -27,12 +27,16 @@ from obsidian_agent.config import _ensure_vault_path
 
 
 class LessonPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     file: str = Field(description="Filename: lesson-XX-topic-name.md")
     title: str = Field(description="Lesson title")
     focus: str = Field(description="Specific topics, questions, and concepts this lesson covers")
 
 
 class UnitPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     folder: str = Field(description="Folder name: 01-unit-kebab-name")
     title: str = Field(description="Unit title")
     overview: str = Field(description="2-3 sentence summary")
@@ -48,6 +52,35 @@ class CurriculumPlan(BaseModel):
     title: str = Field(description="Human-readable project title")
     description: str = Field(description="1-2 paragraph overview")
     units: list[UnitPlan] = Field(description="Units in the curriculum")
+
+
+def _ensure_strict_schema(schema: dict) -> dict:
+    """Recursively inject additionalProperties: false into every object node.
+
+    OpenAI-compatible providers require this for strict json_schema mode.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    if schema.get("type") == "object":
+        schema["additionalProperties"] = False
+
+    for key in ("properties", "items", "$defs", "definitions"):
+        if key not in schema:
+            continue
+        value = schema[key]
+        if isinstance(value, dict):
+            for k, v in value.items():
+                schema[key][k] = _ensure_strict_schema(v)
+        elif isinstance(value, list):
+            schema[key] = [_ensure_strict_schema(v) for v in value]
+
+    # anyOf / allOf / oneOf / enum are arrays of schemas
+    for key in ("anyOf", "allOf", "oneOf"):
+        if key in schema and isinstance(schema[key], list):
+            schema[key] = [_ensure_strict_schema(v) for v in schema[key]]
+
+    return schema
 
 
 _PLAN_CONSTRAINTS = """<CRITICAL_CONSTRAINTS mode="plan">
@@ -228,7 +261,7 @@ DR_PLANNER = Persona(
     temperature=0.1,
     max_steps=15,
     max_tokens=8192,
-    json_schema=CurriculumPlan.model_json_schema(),
+    json_schema=_ensure_strict_schema(CurriculumPlan.model_json_schema()),
 )
 
 DR_EXECUTOR = Persona(
