@@ -1,5 +1,7 @@
 # ObsidianAgent
 
+> Created as an ambassador for Dedalus Labs — check out [https://dedaluslabs.ai](https://dedaluslabs.ai/?utm_source=ambassador&utm_medium=referral&utm_campaign=ambassador_program&utm_content=tarek).
+
 A Dedalus-powered interactive agent for managing your local Obsidian vault through a rich terminal UI.
 
 ## Features
