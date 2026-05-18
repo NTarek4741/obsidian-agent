@@ -21,15 +21,13 @@ A Dedalus-powered interactive agent for managing your local Obsidian vault throu
 1. **Python 3.13+**
 2. **Dedalus API key** from [https://dedaluslabs.ai/dashboard/api-keys](https://dedaluslabs.ai/dashboard/api-keys)
 3. **Obsidian vault path** — the absolute path to your local Obsidian vault (persisted in `.env`)
-4. *(Optional)* For **YouTube transcription**: `yt-dlp` and `youtube-transcript-api`
-5. *(Optional)* For **live recording**: `sounddevice` and `numpy`
 
 ## Setup
 
 1. Clone or navigate to the project directory.
 2. Install dependencies:
    ```bash
-   pip install -e .
+   uv pip install -e .
    ```
 3. Copy the environment file and add your API key:
    ```bash
@@ -46,7 +44,7 @@ A Dedalus-powered interactive agent for managing your local Obsidian vault throu
 Launch the interactive terminal UI:
 
 ```bash
-python main.py
+uv run main.py
 ```
 
 Navigate with arrow keys and Enter. Press **Ctrl+B** to go back, **Ctrl+C** to quit.
@@ -59,29 +57,6 @@ Navigate with arrow keys and Enter. Press **Ctrl+B** to go back, **Ctrl+C** to q
 | **Fast Research** | Topic → web search → single comprehensive markdown note with citations |
 | **Deep Research** | Topic → JSON curriculum plan → full folder structure with overviews, lessons, and sources |
 | **Create Mind Map** | Note → radial mind map canvas + researched sources + learning path appended to note |
-
-## Mind Map Agent
-
-The **Mind Map Agent** transforms any markdown note into a visual radial mind map:
-
-1. **Research Phase** — Uses Brave Search, Defuddle, and Exa to find books, papers, and courses on the topic
-2. **Mind Map Generation** — Creates a radial `.canvas` file with:
-   - Central topic node
-   - 4-6 colored main branches radiating outward
-   - Sub-branches and detail nodes
-   - Isolated "Sources & Next Steps" group
-3. **Note Refinement** — Automatically appends a `## Mind Map Sources & Learning Path` section to the original note with:
-   - Key insights from research
-   - Recommended sources (books, papers, courses)
-   - 3-stage learning progression (Foundation → Application → Mastery)
-   - Related concepts to explore
-
-**Layout rules:**
-- Ultra-generous spacing (center-to-branch: 1000-1200px)
-- Strict maximum node sizes (no overlapping)
-- No edge crossings
-- Color-coded branches (each branch + children share one color)
-- Sources group isolated from main mind map
 
 ## Vault Tools
 
