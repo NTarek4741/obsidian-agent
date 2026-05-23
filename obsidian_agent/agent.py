@@ -11,9 +11,6 @@ from functools import wraps
 from dedalus_labs import AsyncDedalus, DedalusRunner
 from pydantic_core.core_schema import json_schema
 
-from .config import _ensure_vault_path, _load_api_key
-
-
 class Persona:
     """A task-specific persona for the Obsidian Agent."""
 
@@ -68,6 +65,7 @@ async def run_persona(persona: Persona, messages: list):
     Returns the Dedalus runner result for post-processing.
     """
 
+    from obsidian_agent.orchestrator.utility import _load_api_key, _ensure_vault_path
     api_key = _load_api_key()
     vault_path = _ensure_vault_path()
 
@@ -85,7 +83,7 @@ async def run_persona(persona: Persona, messages: list):
         "temperature": persona.temperature,
         "max_tokens": persona.max_tokens,
         "stream": False,
-        "verbose": True,
+        "verbose": False,
         "messages": messages,
     }
     if persona.json_schema:

@@ -1,15 +1,24 @@
-import asyncio
+import subprocess
 import sys
+from pathlib import Path
 
-from obsidian_agent.tui import run_tui
 
+def main() -> None:
+    root = Path(__file__).parent
+    tui_dir = root / "tui"
 
-def main():
+    backend = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "api.app:app", "--port", "8000", "--log-level", "error"],
+        cwd=root,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
     try:
-        asyncio.run(run_tui())
-    except KeyboardInterrupt:
-        print("\nInterrupted. Goodbye.")
-        sys.exit(0)
+        subprocess.run(["node", "dist/index.js"], cwd=tui_dir)
+    finally:
+        backend.terminate()
+        backend.wait()
 
 
 if __name__ == "__main__":
