@@ -12,12 +12,6 @@ echo "========================================"
 echo "[setup] Clean Setup (venv + pip)"
 echo "========================================"
 
-# --- Initial resource check ---
-echo "[setup] Initial disk:"
-df -h /
-echo "[setup] Initial memory:"
-free -h 2>/dev/null || cat /proc/meminfo | head -n 4
-
 # --- 1. Install system packages ---
 echo "[setup] Installing system packages..."
 export DEBIAN_FRONTEND=noninteractive
@@ -103,11 +97,4 @@ if ! curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
     exit 1
 fi
 
-# --- 10. Final resource usage ---
-echo "========================================"
-echo "[setup] Final disk usage:"
-df -h /
-echo "[setup] Final memory usage:"
-free -h 2>/dev/null || cat /proc/meminfo | head -n 4
-echo "========================================"
 echo "[setup] Done! Server is ready."

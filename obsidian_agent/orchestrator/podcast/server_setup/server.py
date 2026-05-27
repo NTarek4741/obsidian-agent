@@ -30,6 +30,8 @@ app = FastAPI()
 API_KEY = os.environ.get("DEDALUS_API_KEY", "")
 DEDALUS_API_URL = "https://api.dedaluslabs.ai/v1/chat/completions"
 
+PODCAST_SYSTEM_PROMPT = """SYSTEM_PROMPT_PLACEHOLDER"""
+
 # Fixed podcast hosts — no AI choice
 HOST_A_VOICE = "af_bella"
 HOST_B_VOICE = "am_adam"
@@ -96,27 +98,7 @@ def _generate_script(note_content: str) -> list[tuple[str, str]]:
     Host A is always af_bella, Host B is always am_adam.
     """
     print("[server] Generating script via Dedalus...")
-    
-    system = """You are an expert podcast producer. Create a NotebookLM-style conversational podcast from the provided note.
-
-FORMAT YOUR RESPONSE EXACTLY LIKE THIS — no other text:
-
-HOST_A: <line of dialogue>
-HOST_B: <line of dialogue>
-HOST_A: <line of dialogue>
-HOST_B: <line of dialogue>
-...etc
-
-RULES:
-- Each line must start with HOST_A: or HOST_B:
-- Make it conversational, warm, and engaging
-- 30-60 lines total (about 5-10 minutes when spoken)
-- Host A (Bella) asks questions and shows curiosity
-- Host B (Adam) explains clearly with enthusiasm
-- Build on each other's points
-- End with a memorable takeaway"""
-
-    text = _call_llm(system, f"Create a podcast from this note:\n\n{note_content}")
+    text = _call_llm(PODCAST_SYSTEM_PROMPT, f"Create a podcast from this note:\n\n{note_content}")
     print(f"[server] Script received ({len(text)} chars)")
     
     # Parse dialogue lines

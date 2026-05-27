@@ -93,9 +93,11 @@ def _run_and_wait(
 
 
 def _get_server_code() -> str:
-    """Read the FastAPI server code."""
-    here = Path(__file__).parent / "server_setup"
-    return (here / "server.py").read_text(encoding="utf-8")
+    """Read the FastAPI server code and inject the system prompt from system_prompts/."""
+    here = Path(__file__).parent
+    server_code = (here / "server_setup" / "server.py").read_text(encoding="utf-8")
+    system_prompt = (here / "system_prompts" / "system_prompt.md").read_text(encoding="utf-8")
+    return server_code.replace("SYSTEM_PROMPT_PLACEHOLDER", system_prompt)
 
 
 def _get_setup_script() -> str:
