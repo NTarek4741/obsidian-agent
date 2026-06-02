@@ -1,4 +1,4 @@
-"""FastAPI server that runs on a Dedalus Machine to generate Anki flashcard decks.
+"""FastAPI server that runs a Dedalus SDK agent to generate Anki flashcard decks.
 
 This file is deployed to /home/machine/flashcard_app/server.py on the VM.
 
@@ -9,6 +9,13 @@ Endpoints:
         Body: {"note_content": "<markdown note>"}
         Auth: Bearer <DEDALUS_API_KEY>
         Response: application/octet-stream (.apkg Anki deck)
+
+Architecture:
+    A `DedalusRunner` agent has three Python tools available in this VM env
+    (which has python + genanki installed):
+      * write_file(path, content)        → writes a genanki script
+      * run_python(script, output_apkg)  → executes the script
+      * deliver_apkg(apkg_path)          → marks the final artifact
 """
 
 import os
@@ -17,18 +24,21 @@ import sys
 import tempfile
 import traceback
 
-import requests
 import uvicorn
-from fastapi import FastAPI, HTTPException, Header, Depends
+from dedalus_labs import AsyncDedalus, DedalusRunner
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 app = FastAPI()
 
 API_KEY = os.environ.get("DEDALUS_API_KEY", "")
-DEDALUS_API_URL = "https://api.dedaluslabs.ai/v1/chat/completions"
+MODEL = "anthropic/claude-sonnet-4-20250514"
 
 FLASHCARD_SYSTEM_PROMPT = """SYSTEM_PROMPT_PLACEHOLDER"""
+
+MAX_AGENT_STEPS = 20
+MAX_OUTPUT_CHARS = 2000
 
 
 class FlashcardRequest(BaseModel):
@@ -49,132 +59,136 @@ async def health():
     return {"status": "ok"}
 
 
-def _call_llm(system_prompt: str, user_prompt: str) -> str:
-    """Call Dedalus LLM API via OpenAI-compatible endpoint."""
-    print(f"[server] Calling Dedalus LLM API (model: anthropic/claude-sonnet-4-20250514)...")
-    try:
-        response = requests.post(
-            DEDALUS_API_URL,
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "anthropic/claude-sonnet-4-20250514",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 4096,
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-        data = response.json()
-        print(f"[server] LLM response received ({len(data)} top-level keys)")
-        return data["choices"][0]["message"]["content"]
-    except requests.exceptions.RequestException as exc:
-        print(f"[server] ERROR: LLM API request failed: {exc}")
-        if hasattr(exc, 'response') and exc.response is not None:
-            print(f"[server] Response status: {exc.response.status_code}")
-            print(f"[server] Response body: {exc.response.text[:500]}")
-        raise
-    except (KeyError, IndexError) as exc:
-        print(f"[server] ERROR: Unexpected LLM response format: {exc}")
-        raise
+# ---------------------------------------------------------------------------
+# Agent tools — module-level, stateless. The endpoint recovers the final
+# apkg path from runner.run()'s tool_results, so no shared state is needed.
+# ---------------------------------------------------------------------------
 
 
-def _strip_fences(code: str) -> str:
-    """Remove markdown code fences if the LLM accidentally included them."""
-    code = code.strip()
-    if code.startswith("```"):
-        lines = code.splitlines()
-        start = 1
-        end = len(lines)
-        if lines[-1].strip() == "```":
-            end = len(lines) - 1
-        code = "\n".join(lines[start:end])
-    return code.strip()
+def write_file(path: str, content: str) -> dict:
+    """Write `content` to `path` as a UTF-8 text file.
 
-
-def _run_genanki_script(note_content: str) -> str:
-    """Use LLM to generate a genanki script, execute it, return path to .apkg.
-
-    The LLM writes the Python script; we run it as a subprocess so genanki
-    (already installed in the venv) creates the Anki deck file directly.
+    Returns the absolute path and byte count of the written file.
+    Use this to write the genanki Python script before running it.
     """
-    user_prompt = (
-        "Generate a genanki flashcard script for the following note. "
-        "Extract all key concepts, definitions, facts, and relationships as Q&A pairs.\n\n"
-        f"NOTE CONTENT:\n{note_content}"
-    )
-
-    print("[server] Requesting genanki script from LLM...")
-    script_code = _call_llm(FLASHCARD_SYSTEM_PROMPT, user_prompt)
-    script_code = _strip_fences(script_code)
-    print(f"[server] Script received ({len(script_code)} chars)")
-
-    # Write generated script to a temp file
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, encoding="utf-8"
-    ) as f:
-        f.write(script_code)
-        script_path = f.name
-
-    apkg_path = tempfile.mktemp(suffix=".apkg")
-
     try:
-        print(f"[server] Executing generated script: {script_path}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        size = os.path.getsize(path)
+        print(f"  write_file: {path} ({size} bytes)")
+        return {"path": path, "bytes": size}
+    except OSError as exc:
+        return {"error": f"write_file failed: {exc}"}
+
+
+def run_python(script_path: str, output_apkg_path: str) -> dict:
+    """Execute a genanki script via `python script_path output_apkg_path`.
+
+    The script must accept the output path as its first argv and call
+    `genanki.Package([deck]).write_to_file(output_apkg_path)`. Returns
+    returncode, truncated stdout, and truncated stderr.
+    """
+    try:
         result = subprocess.run(
-            [sys.executable, script_path, apkg_path],
+            [sys.executable, script_path, output_apkg_path],
             capture_output=True,
             text=True,
             timeout=60,
         )
-    finally:
-        try:
-            os.unlink(script_path)
-        except OSError:
-            pass
+    except subprocess.TimeoutExpired:
+        return {"error": "script timed out after 60s"}
+    except OSError as exc:
+        return {"error": f"run_python failed to spawn: {exc}"}
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Generated script failed (exit {result.returncode}):\n"
-            f"stdout: {result.stdout[:500]}\n"
-            f"stderr: {result.stderr[:500]}\n"
-            f"--- Script (first 1000 chars) ---\n{script_code[:1000]}"
-        )
+    print(
+        f"  run_python: rc={result.returncode} "
+        f"stdout={len(result.stdout)}b stderr={len(result.stderr)}b"
+    )
+    return {
+        "returncode": result.returncode,
+        "stdout": result.stdout[:MAX_OUTPUT_CHARS],
+        "stderr": result.stderr[:MAX_OUTPUT_CHARS],
+    }
 
-    if not os.path.exists(apkg_path) or os.path.getsize(apkg_path) == 0:
-        raise RuntimeError(
-            "Generated script ran but produced no .apkg file. "
-            f"stdout: {result.stdout[:300]}"
-        )
 
-    print(f"[server] .apkg created: {apkg_path} ({os.path.getsize(apkg_path)} bytes)")
-    return apkg_path
+def deliver_apkg(apkg_path: str) -> dict:
+    """Mark the .apkg at `apkg_path` as the final deck to ship to the user.
+
+    Validates the file exists and is non-empty. Call this exactly once,
+    after run_python has produced a working .apkg.
+    """
+    if not apkg_path or not os.path.exists(apkg_path):
+        return {"error": f"apkg_path does not exist: {apkg_path}"}
+    size = os.path.getsize(apkg_path)
+    if size == 0:
+        return {"error": f"apkg_path is empty: {apkg_path}"}
+    print(f"  deliver_apkg: {apkg_path} ({size} bytes)")
+    return {"status": "ok", "apkg_path": apkg_path, "size_bytes": size}
+
+
+TOOLS = [write_file, run_python, deliver_apkg]
+
+
+def _extract_delivered_path(tool_results: list[dict]) -> str | None:
+    """Find the apkg_path captured by the agent's deliver_apkg call."""
+    for entry in tool_results:
+        if entry.get("name") != "deliver_apkg":
+            continue
+        result = entry.get("result")
+        if isinstance(result, dict) and "apkg_path" in result:
+            return result["apkg_path"]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# HTTP endpoint — just runs the agent
+# ---------------------------------------------------------------------------
 
 
 @app.post("/make-flashcard")
 async def make_flashcard(request: FlashcardRequest, token: str = Depends(verify_auth)):
-    print(f"[server] Received flashcard request ({len(request.note_content)} chars)")
+    print(f"Received flashcard request ({len(request.note_content)} chars)")
+
+    workdir = tempfile.mkdtemp(prefix="flashcard_")
+    suggested_apkg = os.path.join(workdir, "deck.apkg")
+    user_prompt = (
+        "Generate an Anki flashcard deck from the following note. Extract every "
+        "key concept, definition, fact, and relationship as a Q&A pair.\n\n"
+        f"Suggested working paths:\n"
+        f"  script_path = {workdir}/build_deck.py\n"
+        f"  output_apkg_path = {suggested_apkg}\n\n"
+        f"NOTE CONTENT:\n{request.note_content}"
+    )
 
     try:
-        apkg_path = _run_genanki_script(request.note_content)
-        print(f"[server] Serving: {apkg_path}")
-        return FileResponse(
-            apkg_path,
-            media_type="application/octet-stream",
-            filename="flashcards.apkg",
+        client = AsyncDedalus(api_key=API_KEY)
+        runner = DedalusRunner(client)
+        result = await runner.run(
+            model=MODEL,
+            instructions=FLASHCARD_SYSTEM_PROMPT,
+            input=user_prompt,
+            tools=TOOLS,
+            max_steps=MAX_AGENT_STEPS,
+            temperature=0.3,
+            max_tokens=4096,
         )
-
     except HTTPException:
         raise
     except Exception as exc:
-        error_msg = f"[server] Error in make_flashcard: {exc}\n{traceback.format_exc()}"
-        print(error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
+        msg = f"Error in make_flashcard: {exc}\n{traceback.format_exc()}"
+        print(msg)
+        raise HTTPException(status_code=500, detail=msg)
+
+    final_path = _extract_delivered_path(result.tool_results)
+    if not final_path:
+        raise HTTPException(status_code=500, detail="Agent did not deliver an .apkg")
+
+    print(f"Serving: {final_path}")
+    return FileResponse(
+        final_path,
+        media_type="application/octet-stream",
+        filename="flashcards.apkg",
+    )
 
 
 if __name__ == "__main__":

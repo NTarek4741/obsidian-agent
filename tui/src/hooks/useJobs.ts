@@ -17,7 +17,7 @@ function filterProgress(incoming: string[], existing: string[]): string[] {
     if (!line) continue;
     if (APT_NOISE_RE.test(line)) {
       if (!bufferedNoise) {
-        const summary = "[setup] installing system packages…";
+        const summary = "Installing system packages…";
         if (out[out.length - 1] !== summary) out.push(summary);
         bufferedNoise = true;
       }
@@ -41,7 +41,7 @@ export function extractResultText(result: Record<string, unknown> | undefined): 
     if (typeof v === "string" && v.trim().length > 0) return v;
   }
   // Surface a path field as a markdown link-ish line.
-  for (const key of ["path", "file", "file_path", "note_path", "mind_map_path"]) {
+  for (const key of ["path", "file", "filepath", "file_path", "note_path", "mind_map_path"]) {
     const v = result[key];
     if (typeof v === "string") return `Saved to \`${v}\``;
   }

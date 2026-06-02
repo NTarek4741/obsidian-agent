@@ -1,7 +1,14 @@
-"""Flashcard orchestrator using a Dedalus Machine.
+"""Flashcard orchestrator using a persistent Dedalus Machine with autosleep.
 
-Flow: Create machine → Setup server → Generate flashcards → Delete machine
-Each deck gets a fresh VM. No wake/sleep.
+Flow:
+  First call:        Create machine (autosleep=30m) → setup server → generate deck
+  Warm reuse:        Machine still running → generate deck immediately
+  After idle window: Dedalus auto-slept the VM → wake → generate deck
+  Machine gone:      Fall back to create + setup
+
+The machine_id is persisted in .machine_state.json next to this module so
+the VM can be reused across processes. Dedalus auto-sleeps the VM after
+AUTOSLEEP_WINDOW of inactivity, so no explicit sleep call is needed.
 
 Machine specs: 1 vCPU / 2 GiB / 5 GiB
 """
@@ -9,7 +16,7 @@ Machine specs: 1 vCPU / 2 GiB / 5 GiB
 from __future__ import annotations
 
 import base64
-import os
+import json
 import time
 from pathlib import Path
 
@@ -18,64 +25,79 @@ from dedalus_sdk import Dedalus
 
 from obsidian_agent.orchestrator.utility import _ensure_vault_path, _load_api_key
 
-# ---------------------------------------------------------------------------
-# Dedalus SDK client
-# ---------------------------------------------------------------------------
-
-
-def _get_dedalus_client():
-    """Return a Dedalus Machines client."""
-    api_key = _load_api_key()
-    return Dedalus(api_key=api_key)
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
-VM_SPECS = {"vcpu": 1, "memory_mib": 2048, "storage_gib": 5}
+DEAD_PHASES = {"destroyed", "failed"}
+RETRYABLE_STATUSES = {500, 502, 503, 504}
+AUTOSLEEP_WINDOW = "30m"
+AUTOSLEEP_SECONDS = 1800
+VM_SPECS = {
+    "vcpu": 1,
+    "memory_mib": 2048,
+    "storage_gib": 5,
+    "autosleep": AUTOSLEEP_WINDOW,
+}
 PREVIEW_VISIBILITY = "org"
 SERVER_PORT = 8000
 MACHINE_APP_DIR = "/home/machine/flashcard_app"
+WAKE_TIMEOUT_S = 600
+CREATE_TIMEOUT_S = 300
+HEALTH_TIMEOUT_S = 180
+POLL_INTERVAL_S = 2
+STATE_FILE = Path(__file__).parent / ".machine_state.json"
 
 
-# ---------------------------------------------------------------------------
-# Execution helper
-# ---------------------------------------------------------------------------
+def _phase(m) -> str:
+    """Pull the phase off a machine response, defaulting to 'unknown'."""
+    return getattr(getattr(m, "status", None), "phase", "unknown")
 
 
 def _run_and_wait(
-    client, machine_id: str, command: list[str], timeout_ms: int = 600_000
+    client, machine_id: str, command: list[str], timeout_ms: int = 600_000,
+    _retries: int = 3,
 ) -> tuple[str, str]:
-    """Execute a command on a machine and block until completion."""
-    exc = client.machines.executions.create(
-        machine_id=machine_id,
-        command=command,
-        timeout_ms=timeout_ms,
-    )
-    delay = 1.0
-    while exc.status not in TERMINAL_STATUSES:
-        wait = (
-            (exc.retry_after_ms or 0) / 1000
-            if exc.status == "wake_in_progress"
-            else delay
+    """Execute a command on a machine and block until completion.
+
+    Retries up to _retries times on execution_runner_interrupted, which is a
+    transient Dedalus platform error (execution controller restarted mid-run).
+    """
+    for attempt in range(_retries + 1):
+        exc = client.machines.executions.create(
+            machine_id=machine_id,
+            command=command,
+            timeout_ms=timeout_ms,
         )
-        time.sleep(wait)
-        delay = min(delay * 1.5, 5.0)
-        exc = client.machines.executions.retrieve(
+        while exc.status not in TERMINAL_STATUSES:
+            wait = (
+                (exc.retry_after_ms or 0) / 1000
+                if exc.status == "wake_in_progress"
+                else POLL_INTERVAL_S
+            )
+            time.sleep(wait)
+            exc = client.machines.executions.retrieve(
+                machine_id=machine_id,
+                execution_id=exc.execution_id,
+            )
+
+        out = client.machines.executions.output(
             machine_id=machine_id,
             execution_id=exc.execution_id,
         )
+        stdout = out.stdout or ""
+        stderr = out.stderr or ""
 
-    out = client.machines.executions.output(
-        machine_id=machine_id,
-        execution_id=exc.execution_id,
-    )
-    stdout = out.stdout or ""
-    stderr = out.stderr or ""
+        if exc.status == "succeeded":
+            return stdout, stderr
 
-    if exc.status != "succeeded":
+        if exc.error_code == "execution_runner_interrupted" and attempt < _retries:
+            wait_s = 10 * (attempt + 1)
+            print(
+                f"execution_runner_interrupted — retrying in {wait_s}s "
+                f"(attempt {attempt + 1}/{_retries})..."
+            )
+            time.sleep(wait_s)
+            continue
+
         raise RuntimeError(
             f"Command failed on machine {machine_id}\n"
             f"Status: {exc.status}\n"
@@ -84,191 +106,237 @@ def _run_and_wait(
             f"Stderr: {stderr[:2000]}"
         )
 
-    return stdout, stderr
-
-
-# ---------------------------------------------------------------------------
-# Server code
-# ---------------------------------------------------------------------------
-
-
-def _get_server_code() -> str:
-    """Read the FastAPI server code and inject the system prompt from system_prompts/."""
-    here = Path(__file__).parent
-    server_code = (here / "server_setup" / "server.py").read_text(encoding="utf-8")
-    system_prompt = (here / "system_prompts" / "system_prompt.md").read_text(encoding="utf-8")
-    return server_code.replace("SYSTEM_PROMPT_PLACEHOLDER", system_prompt)
-
-
-def _get_setup_script() -> str:
-    """Read the VM setup script."""
-    here = Path(__file__).parent / "server_setup"
-    return (here / "setup.sh").read_text(encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Machine lifecycle
-# ---------------------------------------------------------------------------
-
-
-def _machine_status_attr(obj, attr: str, default=""):
-    return getattr(getattr(obj, "status", None), attr, default)
-
-
-def _create_machine_and_wait(client) -> str:
-    """Create a new Dedalus machine and wait for it to be running.
-
-    Returns machine_id.
-    """
-    print("[flashcard] Creating new Dedalus machine...")
-    machine = client.machines.create(**VM_SPECS)
-    machine_id = machine.machine_id
-    print(f"[flashcard] Created: {machine_id}")
-
-    print("[flashcard] Waiting for machine to be running...")
-    for attempt in range(300):
-        m = client.machines.retrieve(machine_id=machine_id)
-        phase = _machine_status_attr(m, "phase", "unknown")
-        if phase == "running":
-            print("[flashcard] Machine is running!")
-            time.sleep(10)
-            return machine_id
-        time.sleep(1)
-
-    raise RuntimeError(f"Machine {machine_id} did not reach running state within 300s")
-
-
-def _delete_machine(client, machine_id: str) -> None:
-    """Delete a machine, ignoring errors."""
-    try:
-        m = client.machines.retrieve(machine_id=machine_id)
-        rev = _machine_status_attr(m, "revision")
-        client.machines.delete(
-            machine_id=machine_id,
-            extra_headers={"If-Match": rev},
-        )
-        print(f"[flashcard] Deleted machine {machine_id}")
-    except Exception as exc:
-        print(f"[flashcard] Warning: could not delete machine: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Server setup on VM
-# ---------------------------------------------------------------------------
-
-
-def _setup_server(client, machine_id: str, api_key: str):
-    """Write server code and setup script to VM, then run setup."""
-    print("[flashcard] Setting up server on VM...")
-
-    print("[flashcard] Creating app directory...")
-    _run_and_wait(
-        client, machine_id,
-        ["/bin/bash", "-c", f"mkdir -p {MACHINE_APP_DIR}"],
-        timeout_ms=10_000,
-    )
-
-    print("[flashcard] Writing server.py...")
-    server_code = _get_server_code()
-    encoded = base64.b64encode(server_code.encode("utf-8")).decode("ascii")
-    _run_and_wait(
-        client, machine_id,
-        ["/bin/bash", "-c", f"echo '{encoded}' | base64 -d > {MACHINE_APP_DIR}/server.py"],
-        timeout_ms=30_000,
-    )
-
-    print("[flashcard] Writing setup script...")
-    setup_script = _get_setup_script()
-    _run_and_wait(
-        client, machine_id,
-        ["/bin/bash", "-c", f"cat > {MACHINE_APP_DIR}/setup.sh << 'EOF'\n{setup_script}\nEOF\nchmod +x {MACHINE_APP_DIR}/setup.sh"],
-        timeout_ms=30_000,
-    )
-
-    print("[flashcard] Running setup script...")
-    stdout, stderr = _run_and_wait(
-        client, machine_id,
-        [
-            "/bin/bash",
-            "-c",
-            f"export DEDALUS_API_KEY='{api_key}' && bash {MACHINE_APP_DIR}/setup.sh",
-        ],
-        timeout_ms=600_000,
-    )
-    print("[flashcard] Setup complete")
-    if stdout.strip():
-        print(f"[flashcard] Setup output:\n{stdout}")
-
-
-# ---------------------------------------------------------------------------
-# Preview management
-# ---------------------------------------------------------------------------
-
-
-def _create_and_wait_preview(client, machine_id: str) -> tuple[str, str]:
-    """Create a preview and wait for it to be ready.
-
-    Returns (preview_url, preview_id).
-    """
-    print("[flashcard] Creating HTTPS preview (org visibility)...")
-    preview = client.machines.previews.create(
-        machine_id=machine_id,
-        port=SERVER_PORT,
-        protocol="https",
-        visibility=PREVIEW_VISIBILITY,
-    )
-    preview_id = preview.preview_id
-    preview_url = preview.url
-    print(f"[flashcard] Preview created: {preview_url}")
-
-    print("[flashcard] Waiting for preview to be ready...")
-    for attempt in range(60):
-        p = client.machines.previews.retrieve(
-            machine_id=machine_id,
-            preview_id=preview_id,
-        )
-        if p.status == "ready":
-            print("[flashcard] Preview is ready!")
-            return preview_url, preview_id
-        elif p.status in ("failed", "expired", "closed"):
-            raise RuntimeError(f"Preview status: {p.status}")
-        time.sleep(1)
-    else:
-        raise RuntimeError("Preview did not become ready within 60s")
-
-
-# ---------------------------------------------------------------------------
-# Main flashcard generation
-# ---------------------------------------------------------------------------
+    raise RuntimeError("Unreachable")
 
 
 def generate_flashcards(note_path: str, note_content: str) -> dict:
-    """Generate an Anki flashcard deck from note content using a fresh Dedalus machine.
+    """Generate an Anki deck using a persistent Dedalus machine with autosleep.
 
-    Always creates a new machine, always deletes it after use (success or failure).
-
-    Returns:
-        {
-            "filepath": str,
-            "filename": str,
-            "size_bytes": int,
-            "machine_id": str,
-        }
+    First call:        create VM, run setup (~2-3 min), generate deck.
+    Warm reuse:        machine still running, generate deck immediately.
+    After idle window: Dedalus auto-slept the VM; wake, generate deck.
     """
     api_key = _load_api_key()
-    client = _get_dedalus_client()
+    client = Dedalus(api_key=api_key)
 
-    machine_id = _create_machine_and_wait(client)
+    # 1. Find a usable VM: reuse persisted one, wake it, or build a fresh one.
+    machine_id: str | None = None
+    is_new = False
 
     try:
-        _setup_server(client, machine_id, api_key)
+        persisted_id = json.loads(STATE_FILE.read_text())["machine_id"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        persisted_id = None
 
-        preview_url, preview_id = _create_and_wait_preview(client, machine_id)
+    if persisted_id:
+        print(f"Found persisted machine: {persisted_id}")
+        try:
+            m = client.machines.retrieve(machine_id=persisted_id)
+            phase = _phase(m)
+            print(f"Machine phase: {phase}")
 
-        print(f"[flashcard] Sending note ({len(note_content)} chars)...")
+            if phase == "sleeping":
+                print(f"Waking machine {persisted_id}...")
+                client.machines.wake(machine_id=persisted_id)
+                deadline = time.time() + WAKE_TIMEOUT_S
+                while time.time() < deadline:
+                    m = client.machines.retrieve(machine_id=persisted_id)
+                    phase = _phase(m)
+                    if phase == "running":
+                        print("Confirmed: phase='running'")
+                        break
+                    if phase in DEAD_PHASES:
+                        raise RuntimeError(
+                            f"Machine {persisted_id} reached terminal phase "
+                            f"'{phase}' while waking"
+                        )
+                    time.sleep(POLL_INTERVAL_S)
+                else:
+                    raise RuntimeError(
+                        f"Timed out after {WAKE_TIMEOUT_S}s waking {persisted_id}"
+                    )
+                time.sleep(5)  # let OS services settle
+                m = client.machines.retrieve(machine_id=persisted_id)
+
+            if phase == "running":
+                if getattr(m, "autosleep_seconds", 0) != AUTOSLEEP_SECONDS:
+                    try:
+                        client.machines.update(
+                            machine_id=persisted_id, autosleep=AUTOSLEEP_WINDOW
+                        )
+                        print(f"Updated autosleep → {AUTOSLEEP_WINDOW}")
+                    except Exception as exc:
+                        print(f"Could not update autosleep: {exc}")
+                machine_id = persisted_id
+            else:
+                print(f"Unusable phase '{phase}' — creating new machine")
+                STATE_FILE.unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"Could not retrieve machine ({exc}) — creating new machine")
+            STATE_FILE.unlink(missing_ok=True)
+
+    if machine_id is None:
+        is_new = True
+
+        print("Creating new Dedalus machine...")
+        machine = client.machines.create(**VM_SPECS)
+        machine_id = machine.machine_id
+        print(f"Created: {machine_id}")
+
+        print("Waiting for machine to be running...")
+        deadline = time.time() + CREATE_TIMEOUT_S
+        while time.time() < deadline:
+            m = client.machines.retrieve(machine_id=machine_id)
+            phase = _phase(m)
+            if phase == "running":
+                print("Machine is running!")
+                time.sleep(10)  # let boot finish
+                break
+            if phase in DEAD_PHASES:
+                raise RuntimeError(
+                    f"Machine {machine_id} reached terminal phase '{phase}' while creating"
+                )
+            time.sleep(POLL_INTERVAL_S)
+        else:
+            raise RuntimeError(
+                f"Machine {machine_id} did not reach running state within {CREATE_TIMEOUT_S}s"
+            )
+
+        print("Setting up server on VM...")
+        here = Path(__file__).parent
+        server_code = (here / "server_setup" / "server.py").read_text(encoding="utf-8")
+        system_prompt = (here / "system_prompts" / "system_prompt.md").read_text(encoding="utf-8")
+        server_code = server_code.replace("SYSTEM_PROMPT_PLACEHOLDER", system_prompt)
+        setup_script = (here / "server_setup" / "setup.sh").read_text(encoding="utf-8")
+
+        print("Creating app directory...")
+        _run_and_wait(
+            client, machine_id,
+            ["/bin/bash", "-c", f"mkdir -p {MACHINE_APP_DIR}"],
+            timeout_ms=10_000,
+        )
+
+        print("Writing server.py...")
+        encoded = base64.b64encode(server_code.encode("utf-8")).decode("ascii")
+        _run_and_wait(
+            client, machine_id,
+            ["/bin/bash", "-c", f"echo '{encoded}' | base64 -d > {MACHINE_APP_DIR}/server.py"],
+            timeout_ms=30_000,
+        )
+
+        print("Writing setup script...")
+        _run_and_wait(
+            client, machine_id,
+            ["/bin/bash", "-c",
+             f"cat > {MACHINE_APP_DIR}/setup.sh << 'EOF'\n{setup_script}\nEOF\n"
+             f"chmod +x {MACHINE_APP_DIR}/setup.sh"],
+            timeout_ms=30_000,
+        )
+
+        print("Running setup script (this may take a few minutes)...")
+        setup_stdout, _ = _run_and_wait(
+            client, machine_id,
+            ["/bin/bash", "-c",
+             f"export DEDALUS_API_KEY='{api_key}' && bash {MACHINE_APP_DIR}/setup.sh"],
+            timeout_ms=600_000,
+        )
+        print("Setup complete")
+        if setup_stdout.strip():
+            print(f"Setup output:\n{setup_stdout}")
+
+        STATE_FILE.write_text(json.dumps({"machine_id": machine_id}))
+        print(f"State saved: {machine_id}")
+
+    # Steps 2-5 share a try/except that tails server.log from the VM on failure.
+    try:
+        # 2. Open a preview URL on the VM (reuse a ready one or create + poll).
+        page = client.machines.previews.list(machine_id=machine_id)
+        if page is None:
+            previews = []
+        elif hasattr(page, "items"):
+            previews = page.items or []
+        else:
+            previews = list(page) if page else []
+
+        preview_url: str | None = None
+        for p in previews:
+            if getattr(p, "status", None) == "ready":
+                preview_url = p.url
+                print(f"Reusing preview: {preview_url}")
+                break
+
+        if preview_url is None:
+            print("Creating new preview...")
+            preview = client.machines.previews.create(
+                machine_id=machine_id,
+                port=SERVER_PORT,
+                protocol="https",
+                visibility=PREVIEW_VISIBILITY,
+            )
+            preview_id = preview.preview_id
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                p = client.machines.previews.retrieve(
+                    machine_id=machine_id, preview_id=preview_id
+                )
+                status = getattr(p, "status", None)
+                if status == "ready":
+                    preview_url = p.url
+                    print(f"Preview ready: {preview_url}")
+                    break
+                if status in ("failed", "expired", "closed"):
+                    raise RuntimeError(f"Preview entered terminal status: {status}")
+                retry_ms = getattr(p, "retry_after_ms", None)
+                time.sleep((retry_ms / 1000) if retry_ms else POLL_INTERVAL_S)
+            else:
+                raise RuntimeError("Preview did not become ready within 90s")
+
+        # 3. Health-check the FastAPI server; relaunch uvicorn if it's gone.
+        healthy = False
+        try:
+            r = httpx.get(f"{preview_url}/health", timeout=10.0)
+            if r.status_code == 200:
+                healthy = True
+                print("Server healthy")
+        except Exception:
+            pass
+
+        if not healthy:
+            print("Server not responding — restarting uvicorn...")
+            start_cmd = (
+                f"cd {MACHINE_APP_DIR} && "
+                f"export DEDALUS_API_KEY='{api_key}' && "
+                f"pkill -f 'uvicorn.*server:app' || true && "
+                f"nohup .venv/bin/python -m uvicorn server:app "
+                f"--host 0.0.0.0 --port {SERVER_PORT} "
+                f"> {MACHINE_APP_DIR}/server.log 2>&1 &"
+            )
+            _run_and_wait(
+                client, machine_id, ["/bin/bash", "-c", start_cmd], timeout_ms=30_000
+            )
+            print(f"Polling server health (up to {HEALTH_TIMEOUT_S}s)...")
+            started = time.time()
+            deadline = started + HEALTH_TIMEOUT_S
+            while time.time() < deadline:
+                try:
+                    r = httpx.get(f"{preview_url}/health", timeout=5.0)
+                    if r.status_code == 200:
+                        print(f"Server healthy after {int(time.time() - started)}s")
+                        healthy = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(POLL_INTERVAL_S)
+            if not healthy:
+                raise RuntimeError(
+                    f"Server did not become healthy within {HEALTH_TIMEOUT_S}s after restart"
+                )
+
+        # 4. POST the note, retry on 5xx and ConnectError with exponential backoff.
+        print(f"Sending note ({len(note_content)} chars)...")
         max_retries = 8
         base_delay = 1.0
-        last_error = None
+        response = None
 
         for attempt in range(max_retries):
             try:
@@ -280,59 +348,52 @@ def generate_flashcards(note_path: str, note_content: str) -> dict:
                 )
                 response.raise_for_status()
                 break
-            except (httpx.HTTPStatusError, httpx.ConnectError) as exc:
-                if isinstance(exc, httpx.HTTPStatusError):
-                    status = exc.response.status_code
-                    if status not in (500, 502, 503, 504):
-                        raise
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    print(f"[flashcard] Retrying in {delay:.0f}s ({attempt + 1}/{max_retries})...")
-                    time.sleep(delay)
-                    last_error = exc
-                    continue
-                raise
-        else:
-            raise last_error or RuntimeError("Failed after all retries")
+            except httpx.HTTPStatusError as exc:
+                if (exc.response.status_code not in RETRYABLE_STATUSES
+                        or attempt == max_retries - 1):
+                    raise
+            except httpx.ConnectError:
+                if attempt == max_retries - 1:
+                    raise
+            delay = base_delay * (2 ** attempt)
+            print(f"Retrying in {delay:.0f}s ({attempt + 1}/{max_retries})...")
+            time.sleep(delay)
 
-        print(f"[flashcard] Received .apkg ({len(response.content)} bytes)")
+        # 5. Save the returned deck to the vault and return metadata.
+        print(f"Received .apkg ({len(response.content)} bytes)")
 
         agent_dir = Path(_ensure_vault_path())
-        flashcards_dir = agent_dir / "flashcards"
-        flashcards_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = agent_dir / "flashcards"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         stem = Path(note_path).stem
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"{stem}_{timestamp}.apkg"
-        filepath = flashcards_dir / filename
-
+        filepath = output_dir / filename
         filepath.write_bytes(response.content)
-        print(f"[flashcard] Saved to: {filepath}")
+        print(f"Saved to: {filepath}")
 
         return {
             "filepath": str(filepath),
             "filename": filename,
             "size_bytes": len(response.content),
             "machine_id": machine_id,
+            "reused_machine": not is_new,
         }
 
     except Exception as exc:
-        print(f"[flashcard] Flashcard generation failed: {exc}")
+        print(f"Flashcard generation failed: {exc}")
         try:
-            print("[flashcard] Fetching server log for debugging...")
             log_stdout, log_stderr = _run_and_wait(
                 client, machine_id,
-                ["/bin/bash", "-c", f"cat {MACHINE_APP_DIR}/server.log 2>/dev/null | tail -100 || echo '(no log file)'"],
+                ["/bin/bash", "-c",
+                 f"cat {MACHINE_APP_DIR}/server.log 2>/dev/null | tail -100 || echo '(no log file)'"],
                 timeout_ms=30_000,
             )
             if log_stdout.strip():
-                print(f"[flashcard] Server log:\n{log_stdout}")
+                print(f"Server log:\n{log_stdout}")
             if log_stderr.strip():
-                print(f"[flashcard] Server log stderr:\n{log_stderr}")
+                print(f"Server log stderr:\n{log_stderr}")
         except Exception as log_exc:
-            print(f"[flashcard] Could not fetch server log: {log_exc}")
+            print(f"Could not fetch server log: {log_exc}")
         raise
-
-    finally:
-        print(f"[flashcard] Deleting machine {machine_id}...")
-        _delete_machine(client, machine_id)

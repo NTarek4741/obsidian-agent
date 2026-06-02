@@ -39,14 +39,6 @@ export interface UrlReq {
   url: string;
 }
 
-export interface DirectResultResp {
-  result: string;
-}
-
-export interface MindMapResp {
-  mind_map_path: string;
-}
-
 export interface JobStatusResp {
   job_id: string;
   kind: string;
@@ -54,13 +46,6 @@ export interface JobStatusResp {
   progress: string[];
   result: Record<string, unknown> | null;
   error: string | null;
-}
-
-export interface JobListItemResp {
-  job_id: string;
-  kind: string;
-  status: string;
-  created_at: number;
 }
 
 export type JobKind =

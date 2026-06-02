@@ -11,7 +11,7 @@ function detailFor(job: JobPanel): string | undefined {
   }
   if (job.status === "failed") return job.error;
   if (job.status === "done" && job.result) {
-    for (const key of ["path", "file", "file_path", "note_path", "mind_map_path", "output"]) {
+    for (const key of ["path", "file", "filepath", "file_path", "note_path", "mind_map_path", "output"]) {
       const v = job.result[key];
       if (typeof v === "string") return v.slice(0, 80);
     }

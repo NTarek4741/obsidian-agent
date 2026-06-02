@@ -1,9 +1,9 @@
-import { useState, useCallback } from "react";
+import { useCallback } from "react";
 import type { APIClient } from "../api/client.js";
-import type { SlashCmd, JobPanel } from "../types/index.js";
+import type { SlashCmd } from "../types/index.js";
 
 export const ALL_SLASH_COMMANDS: SlashCmd[] = [
-  { cmd: "/podcast", meta: "<note-path>      Generate M4A podcast from note" },
+  { cmd: "/podcast", meta: "<note-path>      Generate WAV podcast from note" },
   { cmd: "/flashcard", meta: "<note-path>      Generate Anki deck from note" },
   { cmd: "/transcribe", meta: "<file-path>      Transcribe audio/video file" },
   { cmd: "/transcribe yt", meta: "<url>            Transcribe YouTube video" },
@@ -12,7 +12,6 @@ export const ALL_SLASH_COMMANDS: SlashCmd[] = [
   { cmd: "/research deep", meta: "<topic>          Deep research (plan + build)" },
   { cmd: "/mindmap", meta: "<note-path>      Create mind map from note" },
   { cmd: "/config", meta: "                 Setup API key + vault path" },
-  { cmd: "/jobs", meta: "                 Show active/recent jobs" },
   { cmd: "/clear", meta: "                 Clear the output area" },
   { cmd: "/help", meta: "                 Show all commands" },
   { cmd: "/quit", meta: "                 Quit" },
@@ -21,9 +20,7 @@ export const ALL_SLASH_COMMANDS: SlashCmd[] = [
 export type CommandResult =
   | { type: "message"; text: string }
   | { type: "job_start"; kind: string; jobID: string; realID?: string }
-  | { type: "direct_start"; kind: string }
   | { type: "config" }
-  | { type: "list_jobs" }
   | { type: "clear" }
   | { type: "help" }
   | { type: "quit" }
@@ -32,9 +29,6 @@ export type CommandResult =
 export function useCommands(
   client: APIClient,
   activeJobID: string,
-  onStartJob: (kind: string, jobID: string) => void,
-  onStartDirect: (kind: string) => void,
-  onDirectResult: (kind: string, result: string, err?: string) => void
 ) {
   const dispatch = useCallback(
     async (input: string): Promise<CommandResult[]> => {
@@ -47,10 +41,10 @@ export function useCommands(
       const verb = parts[0].toLowerCase();
       const args = parts.slice(1).join(" ").trim();
 
-      // Block while job is active (except quit/jobs)
-      if (activeJobID && verb !== "quit" && verb !== "jobs") {
+      // Block while job is active (except quit)
+      if (activeJobID && verb !== "quit") {
         return [
-          { type: "message", text: `Job [${activeJobID}] is running — only /quit and /jobs available.` },
+          { type: "message", text: `Job [${activeJobID}] is running — only /quit is available.` },
         ];
       }
 
@@ -63,8 +57,6 @@ export function useCommands(
             const resp = await client.startPodcast(args);
             results.push({ type: "job_start", kind: "podcast", jobID: "", realID: resp.job_id });
           } catch (e) {
-            onStartDirect("podcast");
-            onDirectResult("podcast", "", String(e));
             results.push({ type: "message", text: `Failed to start podcast: ${e}` });
           }
           break;
@@ -76,8 +68,6 @@ export function useCommands(
             const resp = await client.startFlashcard(args);
             results.push({ type: "job_start", kind: "flashcard", jobID: "", realID: resp.job_id });
           } catch (e) {
-            onStartDirect("flashcard");
-            onDirectResult("flashcard", "", String(e));
             results.push({ type: "message", text: `Failed to start flashcard: ${e}` });
           }
           break;
@@ -96,8 +86,6 @@ export function useCommands(
               const resp = await client.startTranscribe(subArgs);
               results.push({ type: "job_start", kind: "transcribe", jobID: "", realID: resp.job_id });
             } catch (e) {
-              onStartDirect("transcribe");
-              onDirectResult("transcribe", "", String(e));
               results.push({ type: "message", text: `Transcribe failed: ${e}` });
             }
           } else {
@@ -107,8 +95,6 @@ export function useCommands(
               const resp = await client.startTranscribe(content);
               results.push({ type: "job_start", kind: "transcribe", jobID: "", realID: resp.job_id });
             } catch (e) {
-              onStartDirect("transcribe");
-              onDirectResult("transcribe", "", String(e));
               results.push({ type: "message", text: `Transcribe failed: ${e}` });
             }
           }
@@ -122,22 +108,17 @@ export function useCommands(
           if (!topic) return [{ type: "message", text: "Usage: /research fast <topic>   or   /research deep <topic>" }];
 
           if (mode === "fast") {
-            onStartDirect("research fast");
             try {
-              const resp = await client.fastResearch(topic);
-              results.push({ type: "message", text: `Research complete: ${resp.result}` });
-              onDirectResult("research fast", resp.result);
+              const resp = await client.startFastResearch(topic);
+              results.push({ type: "job_start", kind: "research fast", jobID: "", realID: resp.job_id });
             } catch (e) {
-              onDirectResult("research fast", "", String(e));
-              results.push({ type: "message", text: `Research failed: ${e}` });
+              results.push({ type: "message", text: `Failed to start research: ${e}` });
             }
           } else if (mode === "deep") {
             try {
               const resp = await client.startDeepResearch(topic);
               results.push({ type: "job_start", kind: "research deep", jobID: "", realID: resp.job_id });
             } catch (e) {
-              onStartDirect("research deep");
-              onDirectResult("research deep", "", String(e));
               results.push({ type: "message", text: `Failed to start deep research: ${e}` });
             }
           } else {
@@ -148,25 +129,17 @@ export function useCommands(
 
         case "mindmap": {
           if (!args) return [{ type: "message", text: "Usage: /mindmap <note-path>" }];
-          onStartDirect("mindmap");
           try {
-            const resp = await client.mindMap(args);
-            results.push({ type: "message", text: `Mind map saved: ${resp.mind_map_path}` });
-            onDirectResult("mindmap", resp.mind_map_path);
+            const resp = await client.startMindMap(args);
+            results.push({ type: "job_start", kind: "mindmap", jobID: "", realID: resp.job_id });
           } catch (e) {
-            onDirectResult("mindmap", "", String(e));
-            results.push({ type: "message", text: `Mind map failed: ${e}` });
+            results.push({ type: "message", text: `Failed to start mind map: ${e}` });
           }
           break;
         }
 
         case "config": {
           results.push({ type: "config" });
-          break;
-        }
-
-        case "jobs": {
-          results.push({ type: "list_jobs" });
           break;
         }
 
@@ -192,7 +165,7 @@ export function useCommands(
 
       return results;
     },
-    [client, activeJobID, onStartJob, onStartDirect, onDirectResult]
+    [client, activeJobID]
   );
 
   return { dispatch };

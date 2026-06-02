@@ -61,6 +61,7 @@ htmlcov/
 # Agent outputs (auto-generated)
 agent/
 *.canvas
+.machine_state.json
 
 # Keep uv.lock in repo for reproducible builds
 # uv.lock

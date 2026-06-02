@@ -101,19 +101,7 @@ export function App({ backendURL }: AppProps) {
     });
   }, []);
 
-  const { dispatch } = useCommands(
-    client,
-    activeJobID,
-    addJob,
-    (kind) => addJob(kind, ""),
-    (kind, result, err) => {
-      const key = `_${kind}`;
-      updateJob(key, err ? "failed" : "done", ["done"], err);
-      dropThinking();
-      if (err) pushAssistant(`✗ **${kind}** failed: ${err}`);
-      else if (result) pushAssistant(result);
-    }
-  );
+  const { dispatch } = useCommands(client, activeJobID);
 
   useEffect(() => {
     const onResize = () => {
@@ -283,12 +271,6 @@ export function App({ backendURL }: AppProps) {
           startPolling(key);
           break;
         }
-        case "direct_start": {
-          dropThinking();
-          const key = addJob(res.kind, "", val);
-          pushJob(key);
-          break;
-        }
         case "transcribe_live":
           dropThinking();
           startLiveRecord();
@@ -296,29 +278,12 @@ export function App({ backendURL }: AppProps) {
         case "config":
           setShowConfig(true);
           break;
-        case "list_jobs": {
-          try {
-            const list = await client.listJobs();
-            if (list.length === 0) pushAssistant("_no jobs found_");
-            else {
-              const lines = ["**Recent jobs**", ""];
-              for (const j of list) {
-                const icon = j.status === "done" ? "✓" : j.status === "failed" ? "✗" : "■";
-                lines.push(`- ${icon} \`${j.job_id}\` · ${j.kind}`);
-              }
-              pushAssistant(lines.join("\n"));
-            }
-          } catch (e) {
-            pushAssistant(`✗ /jobs failed: ${e}`);
-          }
-          break;
-        }
         case "clear":
           setItems([]);
           break;
         case "help": {
           const cmds = [
-            "/podcast <note-path>      Generate M4A podcast from note",
+            "/podcast <note-path>      Generate WAV podcast from note",
             "/flashcard <note-path>    Generate Anki deck from note",
             "/transcribe <file>        Transcribe audio/video file",
             "/transcribe yt <url>      Transcribe YouTube video",

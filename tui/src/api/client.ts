@@ -5,10 +5,7 @@ import type {
   JobResp,
   TopicReq,
   NotePathReq,
-  DirectResultResp,
-  MindMapResp,
   JobStatusResp,
-  JobListItemResp,
 } from "../types/index.js";
 
 export class APIClient {
@@ -60,12 +57,12 @@ export class APIClient {
     return this.postJSON<JobResp>("/research/deep", { topic } as TopicReq);
   }
 
-  fastResearch(topic: string): Promise<DirectResultResp> {
-    return this.postJSON<DirectResultResp>("/research/fast", { topic } as TopicReq);
+  startFastResearch(topic: string): Promise<JobResp> {
+    return this.postJSON<JobResp>("/research/fast", { topic } as TopicReq);
   }
 
-  mindMap(notePath: string): Promise<MindMapResp> {
-    return this.postJSON<MindMapResp>("/mind-map", { note_path: notePath } as NotePathReq);
+  startMindMap(notePath: string): Promise<JobResp> {
+    return this.postJSON<JobResp>("/mind-map", { note_path: notePath } as NotePathReq);
   }
 
   startTranscribe(content: string): Promise<JobResp> {
@@ -74,9 +71,5 @@ export class APIClient {
 
   pollJob(jobID: string): Promise<JobStatusResp> {
     return this.getJSON<JobStatusResp>(`/jobs/${jobID}`);
-  }
-
-  listJobs(): Promise<JobListItemResp[]> {
-    return this.getJSON<JobListItemResp[]>("/jobs");
   }
 }
