@@ -38,10 +38,35 @@ cd "$APP_DIR"
 python3 -m venv .venv
 .venv/bin/pip install --no-cache-dir -q fastapi uvicorn genanki dedalus-labs
 
-# 3. Start uvicorn in the background.
-echo "Starting FastAPI server..."
-nohup .venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port "$PORT" > "$LOG_FILE" 2>&1 &
-echo "Server PID: $!"
+# 3. Install uvicorn as a systemd service so it auto-restarts on every VM
+#    boot (including post-wake). Secret lives in a separate EnvironmentFile.
+echo "Installing flashcard-server.service..."
+echo "DEDALUS_API_KEY=${DEDALUS_API_KEY}" > /etc/flashcard-server.env
+chmod 600 /etc/flashcard-server.env
+
+cat >/etc/systemd/system/flashcard-server.service <<'SYSTEMD_UNIT'
+[Unit]
+Description=Flashcard FastAPI server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/machine/flashcard_app
+EnvironmentFile=/etc/flashcard-server.env
+ExecStart=/home/machine/flashcard_app/.venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=2
+StandardOutput=append:/home/machine/flashcard_app/server.log
+StandardError=append:/home/machine/flashcard_app/server.log
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_UNIT
+
+systemctl daemon-reload
+systemctl enable --now flashcard-server
+echo "flashcard-server.service enabled and started"
 
 # 4. Poll /health for 30s; tail server.log and exit 1 on failure.
 echo "Waiting for server health check..."

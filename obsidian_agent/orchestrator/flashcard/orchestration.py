@@ -28,7 +28,6 @@ from obsidian_agent.orchestrator.utility import _ensure_vault_path, _load_api_ke
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
 DEAD_PHASES = {"destroyed", "failed"}
-RETRYABLE_STATUSES = {500, 502, 503, 504}
 AUTOSLEEP_WINDOW = "30m"
 AUTOSLEEP_SECONDS = 1800
 VM_SPECS = {
@@ -42,7 +41,6 @@ SERVER_PORT = 8000
 MACHINE_APP_DIR = "/home/machine/flashcard_app"
 WAKE_TIMEOUT_S = 600
 CREATE_TIMEOUT_S = 300
-HEALTH_TIMEOUT_S = 180
 POLL_INTERVAL_S = 2
 STATE_FILE = Path(__file__).parent / ".machine_state.json"
 
@@ -107,6 +105,58 @@ def _run_and_wait(
         )
 
     raise RuntimeError("Unreachable")
+
+
+def _run_setup(client, machine_id: str, api_key: str) -> None:
+    """Write server.py + setup.sh onto the VM and run setup.sh.
+
+    Idempotent: rerunning is safe — setup.sh reinstalls the venv, rewrites the
+    systemd unit, and `systemctl enable --now` is a no-op on the second run.
+    Called both on fresh machine creation and on wake if the app dir was wiped.
+    """
+    here = Path(__file__).parent
+    server_code = (here / "server_setup" / "server.py").read_text(encoding="utf-8")
+    system_prompt = (here / "system_prompts" / "system_prompt.md").read_text(encoding="utf-8")
+    server_code = server_code.replace("SYSTEM_PROMPT_PLACEHOLDER", system_prompt)
+    setup_script = (here / "server_setup" / "setup.sh").read_text(encoding="utf-8")
+
+    print("Creating app directory...")
+    _run_and_wait(
+        client, machine_id,
+        ["/bin/bash", "-c", f"mkdir -p {MACHINE_APP_DIR}"],
+        timeout_ms=10_000,
+    )
+
+    print("Writing server.py...")
+    encoded = base64.b64encode(server_code.encode("utf-8")).decode("ascii")
+    _run_and_wait(
+        client, machine_id,
+        ["/bin/bash", "-c", f"echo '{encoded}' | base64 -d > {MACHINE_APP_DIR}/server.py"],
+        timeout_ms=30_000,
+    )
+
+    print("Writing setup script...")
+    # base64 the wire format — setup.sh contains its own heredocs (systemd unit
+    # file), and a naive `cat > … << EOF` wrapper terminates at the FIRST EOF.
+    setup_encoded = base64.b64encode(setup_script.encode("utf-8")).decode("ascii")
+    _run_and_wait(
+        client, machine_id,
+        ["/bin/bash", "-c",
+         f"echo '{setup_encoded}' | base64 -d > {MACHINE_APP_DIR}/setup.sh && "
+         f"chmod +x {MACHINE_APP_DIR}/setup.sh"],
+        timeout_ms=30_000,
+    )
+
+    print("Running setup script (this may take a few minutes)...")
+    setup_stdout, _ = _run_and_wait(
+        client, machine_id,
+        ["/bin/bash", "-c",
+         f"export DEDALUS_API_KEY='{api_key}' && bash {MACHINE_APP_DIR}/setup.sh"],
+        timeout_ms=600_000,
+    )
+    print("Setup complete")
+    if setup_stdout.strip():
+        print(f"Setup output:\n{setup_stdout}")
 
 
 def generate_flashcards(note_path: str, note_content: str) -> dict:
@@ -203,46 +253,7 @@ def generate_flashcards(note_path: str, note_content: str) -> dict:
             )
 
         print("Setting up server on VM...")
-        here = Path(__file__).parent
-        server_code = (here / "server_setup" / "server.py").read_text(encoding="utf-8")
-        system_prompt = (here / "system_prompts" / "system_prompt.md").read_text(encoding="utf-8")
-        server_code = server_code.replace("SYSTEM_PROMPT_PLACEHOLDER", system_prompt)
-        setup_script = (here / "server_setup" / "setup.sh").read_text(encoding="utf-8")
-
-        print("Creating app directory...")
-        _run_and_wait(
-            client, machine_id,
-            ["/bin/bash", "-c", f"mkdir -p {MACHINE_APP_DIR}"],
-            timeout_ms=10_000,
-        )
-
-        print("Writing server.py...")
-        encoded = base64.b64encode(server_code.encode("utf-8")).decode("ascii")
-        _run_and_wait(
-            client, machine_id,
-            ["/bin/bash", "-c", f"echo '{encoded}' | base64 -d > {MACHINE_APP_DIR}/server.py"],
-            timeout_ms=30_000,
-        )
-
-        print("Writing setup script...")
-        _run_and_wait(
-            client, machine_id,
-            ["/bin/bash", "-c",
-             f"cat > {MACHINE_APP_DIR}/setup.sh << 'EOF'\n{setup_script}\nEOF\n"
-             f"chmod +x {MACHINE_APP_DIR}/setup.sh"],
-            timeout_ms=30_000,
-        )
-
-        print("Running setup script (this may take a few minutes)...")
-        setup_stdout, _ = _run_and_wait(
-            client, machine_id,
-            ["/bin/bash", "-c",
-             f"export DEDALUS_API_KEY='{api_key}' && bash {MACHINE_APP_DIR}/setup.sh"],
-            timeout_ms=600_000,
-        )
-        print("Setup complete")
-        if setup_stdout.strip():
-            print(f"Setup output:\n{setup_stdout}")
+        _run_setup(client, machine_id, api_key)
 
         STATE_FILE.write_text(json.dumps({"machine_id": machine_id}))
         print(f"State saved: {machine_id}")
@@ -291,54 +302,34 @@ def generate_flashcards(note_path: str, note_content: str) -> dict:
             else:
                 raise RuntimeError("Preview did not become ready within 90s")
 
-        # 3. Health-check the FastAPI server; relaunch uvicorn if it's gone.
-        healthy = False
-        try:
-            r = httpx.get(f"{preview_url}/health", timeout=10.0)
-            if r.status_code == 200:
-                healthy = True
-                print("Server healthy")
-        except Exception:
-            pass
+        # 3. uvicorn runs as flashcard-server.service — systemd starts it on
+        # every VM boot (including post-wake). If the app dir is missing
+        # (rare: a Dedalus-side reset, or a machine we inherited without
+        # setup), re-run setup.sh; otherwise the POST below hits the
+        # already-listening service.
+        check_out, _ = _run_and_wait(
+            client, machine_id,
+            ["/bin/bash", "-c",
+             f"test -x {MACHINE_APP_DIR}/.venv/bin/python && echo OK || echo MISSING"],
+            timeout_ms=10_000,
+        )
+        if "MISSING" in check_out:
+            print("App directory missing — re-running setup.sh (~3 min)...")
+            _run_setup(client, machine_id, api_key)
 
-        if not healthy:
-            print("Server not responding — restarting uvicorn...")
-            start_cmd = (
-                f"cd {MACHINE_APP_DIR} && "
-                f"export DEDALUS_API_KEY='{api_key}' && "
-                f"pkill -f 'uvicorn.*server:app' || true && "
-                f"nohup .venv/bin/python -m uvicorn server:app "
-                f"--host 0.0.0.0 --port {SERVER_PORT} "
-                f"> {MACHINE_APP_DIR}/server.log 2>&1 &"
-            )
-            _run_and_wait(
-                client, machine_id, ["/bin/bash", "-c", start_cmd], timeout_ms=30_000
-            )
-            print(f"Polling server health (up to {HEALTH_TIMEOUT_S}s)...")
-            started = time.time()
-            deadline = started + HEALTH_TIMEOUT_S
-            while time.time() < deadline:
-                try:
-                    r = httpx.get(f"{preview_url}/health", timeout=5.0)
-                    if r.status_code == 200:
-                        print(f"Server healthy after {int(time.time() - started)}s")
-                        healthy = True
-                        break
-                except Exception:
-                    pass
-                time.sleep(POLL_INTERVAL_S)
-            if not healthy:
-                raise RuntimeError(
-                    f"Server did not become healthy within {HEALTH_TIMEOUT_S}s after restart"
-                )
-
-        # 4. POST the note, retry on 5xx and ConnectError with exponential backoff.
+        # 4. POST the note. Tight retries on transient errors (ConnectError +
+        # gateway 502/503/504 while uvicorn warms up); conservative exponential
+        # on 500 (real server-side bug).
         print(f"Sending note ({len(note_content)} chars)...")
-        max_retries = 8
-        base_delay = 1.0
+        TRANSIENT_5XX = {502, 503, 504}
+        WARMUP_RETRY_DELAY_S = 1.0
+        MAX_WARMUP_RETRIES = 60
+        MAX_500_RETRIES = 5
+        warmup_attempts = 0
+        http500_attempts = 0
         response = None
 
-        for attempt in range(max_retries):
+        while True:
             try:
                 response = httpx.post(
                     f"{preview_url}/make-flashcard",
@@ -348,16 +339,34 @@ def generate_flashcards(note_path: str, note_content: str) -> dict:
                 )
                 response.raise_for_status()
                 break
-            except httpx.HTTPStatusError as exc:
-                if (exc.response.status_code not in RETRYABLE_STATUSES
-                        or attempt == max_retries - 1):
-                    raise
             except httpx.ConnectError:
-                if attempt == max_retries - 1:
+                warmup_attempts += 1
+                if warmup_attempts == 1:
+                    print("Waiting for uvicorn to accept connections...")
+                if warmup_attempts >= MAX_WARMUP_RETRIES:
                     raise
-            delay = base_delay * (2 ** attempt)
-            print(f"Retrying in {delay:.0f}s ({attempt + 1}/{max_retries})...")
-            time.sleep(delay)
+                time.sleep(WARMUP_RETRY_DELAY_S)
+            except httpx.HTTPStatusError as exc:
+                code = exc.response.status_code
+                if code in TRANSIENT_5XX:
+                    warmup_attempts += 1
+                    if warmup_attempts == 1:
+                        print(f"Gateway returned {code} — waiting for upstream to come up...")
+                    if warmup_attempts >= MAX_WARMUP_RETRIES:
+                        raise
+                    time.sleep(WARMUP_RETRY_DELAY_S)
+                elif code == 500:
+                    http500_attempts += 1
+                    if http500_attempts >= MAX_500_RETRIES:
+                        raise
+                    delay = 2.0 * (2 ** (http500_attempts - 1))
+                    print(
+                        f"Server returned 500 — retrying in {delay:.0f}s "
+                        f"({http500_attempts}/{MAX_500_RETRIES})..."
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
 
         # 5. Save the returned deck to the vault and return metadata.
         print(f"Received .apkg ({len(response.content)} bytes)")

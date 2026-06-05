@@ -49,10 +49,35 @@ for _, _, audio in pipeline('Hello world', voice='af_bella'):
         break
 "
 
-# 4. Start uvicorn in the background.
-echo "Starting FastAPI server..."
-nohup .venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port "$PORT" > "$LOG_FILE" 2>&1 &
-echo "Server PID: $!"
+# 4. Install uvicorn as a systemd service so it auto-restarts on every VM
+#    boot (including post-wake). Secret lives in a separate EnvironmentFile.
+echo "Installing podcast-server.service..."
+echo "DEDALUS_API_KEY=${DEDALUS_API_KEY}" > /etc/podcast-server.env
+chmod 600 /etc/podcast-server.env
+
+cat >/etc/systemd/system/podcast-server.service <<'SYSTEMD_UNIT'
+[Unit]
+Description=Podcast FastAPI server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/machine/podcast_app
+EnvironmentFile=/etc/podcast-server.env
+ExecStart=/home/machine/podcast_app/.venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=2
+StandardOutput=append:/home/machine/podcast_app/server.log
+StandardError=append:/home/machine/podcast_app/server.log
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_UNIT
+
+systemctl daemon-reload
+systemctl enable --now podcast-server
+echo "podcast-server.service enabled and started"
 
 # 5. Poll /health for 30s; tail server.log and exit 1 on failure.
 echo "Waiting for server health check..."
