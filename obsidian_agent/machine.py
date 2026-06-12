@@ -30,7 +30,6 @@ import gzip
 import hashlib
 import io
 import json
-import os
 import tarfile
 import threading
 import time
@@ -41,6 +40,8 @@ from typing import Callable, Iterator
 
 import httpx
 from dedalus_sdk import Dedalus
+
+from obsidian_agent.config import _load_api_key
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
 DEAD_PHASES = {"destroyed", "failed"}
@@ -89,7 +90,7 @@ class MachineHandle:
     spec: MachineSpec
     machine_id: str
     base_url: str
-    client: Dedalus | None     # None when OBSIDIAN_MACHINE_URL_<NAME> override is active
+    client: Dedalus
     api_key: str
     reused: bool
 
@@ -143,9 +144,10 @@ def get_spec(name: str) -> MachineSpec:
 # ---------------------------------------------------------------------------
 # Registry (machines.json)
 # ---------------------------------------------------------------------------
-
-_REGISTRY_LOCK = threading.Lock()
-_ENSURE_LOCKS = {name: threading.Lock() for name in MACHINES}
+#
+# No locking needed: the backend runs exactly one job at a time (gate in
+# api/utils.py) and DELETE /machines is rejected while a job runs, so the
+# registry is only ever touched by one worker.
 
 
 def _registry_load() -> dict:
@@ -163,26 +165,23 @@ def _registry_save(reg: dict) -> None:
 
 
 def _registry_get(name: str) -> dict:
-    with _REGISTRY_LOCK:
-        return dict(_registry_load()["machines"].get(name) or {})
+    return dict(_registry_load()["machines"].get(name) or {})
 
 
 def _registry_set(name: str, machine_id: str, bundle_sha256: str | None) -> None:
-    with _REGISTRY_LOCK:
-        reg = _registry_load()
-        reg["machines"][name] = {
-            "machine_id": machine_id,
-            "bundle_sha256": bundle_sha256,
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        _registry_save(reg)
+    reg = _registry_load()
+    reg["machines"][name] = {
+        "machine_id": machine_id,
+        "bundle_sha256": bundle_sha256,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _registry_save(reg)
 
 
 def forget_machine(name: str) -> None:
-    with _REGISTRY_LOCK:
-        reg = _registry_load()
-        reg["machines"].pop(name, None)
-        _registry_save(reg)
+    reg = _registry_load()
+    reg["machines"].pop(name, None)
+    _registry_save(reg)
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +193,9 @@ def forget_machine(name: str) -> None:
 # the showcase is *seeing* machines wake from snapshots, sync, and get
 # destroyed, not just receiving their outputs.
 
+# The ONE lock in this codebase: the active job's worker thread writes here
+# (via _emit/_set_state) while the API's event-loop thread reads machine_status()
+# for GET /machines. Everything else is serialized by the single-job gate.
 _STATE_LOCK = threading.Lock()
 _machine_state: dict[str, dict] = {}
 _machine_events: deque = deque(maxlen=60)
@@ -241,7 +243,6 @@ def machine_status() -> dict:
     return {"machines": machines, "events": events}
 
 
-_PHASE_REFRESH_LOCK = threading.Lock()
 _last_phase_refresh = 0.0
 
 
@@ -253,13 +254,9 @@ def refresh_machine_phases(max_age_s: float = 60.0) -> None:
     transitions (running → sleeping) without any job running.
     """
     global _last_phase_refresh
-    with _PHASE_REFRESH_LOCK:
-        if time.time() - _last_phase_refresh < max_age_s:
-            return
-        _last_phase_refresh = time.time()
-
-    # Deferred: orchestrator/__init__ imports modules that import this module.
-    from obsidian_agent.orchestrator.config import _load_api_key
+    if time.time() - _last_phase_refresh < max_age_s:
+        return
+    _last_phase_refresh = time.time()
 
     try:
         client = Dedalus(api_key=_load_api_key())
@@ -585,143 +582,127 @@ def ensure_machine(spec: MachineSpec, *, log: Callable[[str], None] = print) -> 
             f"Machine '{spec.name}' is ephemeral — use ephemeral_machine() instead"
         )
 
-    # Deferred: orchestrator/__init__ imports modules that import this module.
-    from obsidian_agent.orchestrator.config import _load_api_key
-
     api_key = _load_api_key()
-
-    override = os.getenv(f"OBSIDIAN_MACHINE_URL_{spec.name.upper()}", "").strip()
-    if override:
-        return MachineHandle(
-            spec=spec,
-            machine_id=f"local-{spec.name}",
-            base_url=override.rstrip("/"),
-            client=None,
-            api_key=api_key,
-            reused=True,
-        )
-
     client = Dedalus(api_key=api_key)
 
     try:
-        return _ensure_machine_locked(spec, client, api_key, log=log)
+        return _ensure_machine_impl(spec, client, api_key, log=log)
     except Exception as exc:
         _emit(spec.name, f"error: {exc}", phase="error")
         raise
 
 
-def _ensure_machine_locked(
+def _ensure_machine_impl(
     spec: MachineSpec,
     client: Dedalus,
     api_key: str,
     *,
     log: Callable[[str], None],
 ) -> MachineHandle:
-    with _ENSURE_LOCKS[spec.name]:
-        entry = _registry_get(spec.name)
-        machine_id: str | None = entry.get("machine_id")
-        bundle_sha: str | None = entry.get("bundle_sha256")
+    entry = _registry_get(spec.name)
+    machine_id: str | None = entry.get("machine_id")
+    bundle_sha: str | None = entry.get("bundle_sha256")
 
-        # 1. Reuse the persisted machine if it is still alive.
-        if machine_id:
-            log(f"Found persisted machine: {machine_id}")
-            try:
+    # 1. Reuse the persisted machine if it is still alive.
+    if machine_id:
+        log(f"Found persisted machine: {machine_id}")
+        try:
+            m = client.machines.retrieve(machine_id=machine_id)
+            phase = _phase(m)
+            log(f"Machine phase: {phase}")
+            _emit(spec.name, f"found {machine_id} ({phase})",
+                  phase=phase, machine_id=machine_id)
+
+            if phase == "sleeping":
+                log(f"Waking machine {machine_id}...")
+                _emit(spec.name, "waking from snapshot…", phase="waking")
+                wake_t0 = time.monotonic()
+                client.machines.wake(machine_id=machine_id)
+                _wait_for_phase(client, machine_id, spec.wake_timeout_s,
+                                action="waking", log=log)
+                wake_s = round(time.monotonic() - wake_t0, 1)
+                _emit(spec.name, f"woke in {wake_s:.0f}s",
+                      phase="running", wake_seconds=wake_s)
+                time.sleep(5)  # let OS services settle
                 m = client.machines.retrieve(machine_id=machine_id)
                 phase = _phase(m)
-                log(f"Machine phase: {phase}")
-                _emit(spec.name, f"found {machine_id} ({phase})",
-                      phase=phase, machine_id=machine_id)
 
-                if phase == "sleeping":
-                    log(f"Waking machine {machine_id}...")
-                    _emit(spec.name, "waking from snapshot…", phase="waking")
-                    wake_t0 = time.monotonic()
-                    client.machines.wake(machine_id=machine_id)
-                    _wait_for_phase(client, machine_id, spec.wake_timeout_s,
-                                    action="waking", log=log)
-                    wake_s = round(time.monotonic() - wake_t0, 1)
-                    _emit(spec.name, f"woke in {wake_s:.0f}s",
-                          phase="running", wake_seconds=wake_s)
-                    time.sleep(5)  # let OS services settle
-                    m = client.machines.retrieve(machine_id=machine_id)
-                    phase = _phase(m)
-
-                if phase == "running":
-                    if getattr(m, "autosleep_seconds", 0) != spec.autosleep_seconds:
-                        try:
-                            client.machines.update(
-                                machine_id=machine_id, autosleep=spec.autosleep
-                            )
-                            log(f"Updated autosleep → {spec.autosleep}")
-                        except Exception as exc:
-                            log(f"Could not update autosleep: {exc}")
-                else:
-                    log(f"Unusable phase '{phase}' — creating new machine")
-                    _emit(spec.name, f"unusable phase '{phase}' — recreating")
-                    forget_machine(spec.name)
-                    machine_id = None
-            except Exception as exc:
-                log(f"Could not retrieve machine ({exc}) — creating new machine")
-                _emit(spec.name, "machine gone — recreating")
+            if phase == "running":
+                if getattr(m, "autosleep_seconds", 0) != spec.autosleep_seconds:
+                    try:
+                        client.machines.update(
+                            machine_id=machine_id, autosleep=spec.autosleep
+                        )
+                        log(f"Updated autosleep → {spec.autosleep}")
+                    except Exception as exc:
+                        log(f"Could not update autosleep: {exc}")
+            else:
+                log(f"Unusable phase '{phase}' — creating new machine")
+                _emit(spec.name, f"unusable phase '{phase}' — recreating")
                 forget_machine(spec.name)
                 machine_id = None
+        except Exception as exc:
+            log(f"Could not retrieve machine ({exc}) — creating new machine")
+            _emit(spec.name, "machine gone — recreating")
+            forget_machine(spec.name)
+            machine_id = None
 
-        # 2. Create + bootstrap a fresh machine if needed.
-        reused = machine_id is not None
-        if machine_id is None:
-            log("Creating new Dedalus machine...")
-            _emit(spec.name, "creating machine…", phase="creating", machine_id=None)
-            machine = client.machines.create(
-                vcpu=spec.vcpu,
-                memory_mib=spec.memory_mib,
-                storage_gib=spec.storage_gib,
-                autosleep=spec.autosleep,
-            )
-            machine_id = machine.machine_id
-            log(f"Created: {machine_id}")
-            _emit(spec.name, f"created {machine_id}", machine_id=machine_id)
+    # 2. Create + bootstrap a fresh machine if needed.
+    reused = machine_id is not None
+    if machine_id is None:
+        log("Creating new Dedalus machine...")
+        _emit(spec.name, "creating machine…", phase="creating", machine_id=None)
+        machine = client.machines.create(
+            vcpu=spec.vcpu,
+            memory_mib=spec.memory_mib,
+            storage_gib=spec.storage_gib,
+            autosleep=spec.autosleep,
+        )
+        machine_id = machine.machine_id
+        log(f"Created: {machine_id}")
+        _emit(spec.name, f"created {machine_id}", machine_id=machine_id)
 
-            log("Waiting for machine to be running...")
-            _wait_for_phase(client, machine_id, spec.create_timeout_s,
-                            action="creating", log=log)
-            time.sleep(10)  # let boot finish
+        log("Waiting for machine to be running...")
+        _wait_for_phase(client, machine_id, spec.create_timeout_s,
+                        action="creating", log=log)
+        time.sleep(10)  # let boot finish
 
-            log("Setting up server on VM...")
-            _emit(spec.name, "deploying bundle + running setup…", phase="setup")
+        log("Setting up server on VM...")
+        _emit(spec.name, "deploying bundle + running setup…", phase="setup")
+        bundle_sha = _deploy_and_setup(
+            client, machine_id, spec, api_key, full_setup=True, log=log
+        )
+        _registry_set(spec.name, machine_id, bundle_sha)
+    else:
+        # 3. Health check: systemd starts the server on every boot, but if
+        # the app dir was wiped (Dedalus-side reset, inherited machine),
+        # re-run the full setup. Otherwise refresh files when the local
+        # bundle differs from what was last deployed.
+        check_out, _ = run_command(
+            client, machine_id,
+            ["/bin/bash", "-c",
+             f"test -x {spec.app_dir}/.venv/bin/python && echo OK || echo MISSING"],
+            timeout_ms=10_000, log=log,
+        )
+        if "MISSING" in check_out:
+            log("App directory missing — re-running full setup...")
+            _emit(spec.name, "app dir missing — full setup…", phase="setup")
             bundle_sha = _deploy_and_setup(
                 client, machine_id, spec, api_key, full_setup=True, log=log
             )
             _registry_set(spec.name, machine_id, bundle_sha)
         else:
-            # 3. Health check: systemd starts the server on every boot, but if
-            # the app dir was wiped (Dedalus-side reset, inherited machine),
-            # re-run the full setup. Otherwise refresh files when the local
-            # bundle differs from what was last deployed.
-            check_out, _ = run_command(
-                client, machine_id,
-                ["/bin/bash", "-c",
-                 f"test -x {spec.app_dir}/.venv/bin/python && echo OK || echo MISSING"],
-                timeout_ms=10_000, log=log,
-            )
-            if "MISSING" in check_out:
-                log("App directory missing — re-running full setup...")
-                _emit(spec.name, "app dir missing — full setup…", phase="setup")
+            _, current_sha = _build_bundle(spec)
+            if current_sha != bundle_sha:
+                log("Server files changed — refreshing bundle...")
+                _emit(spec.name, "refreshing server files…", phase="refreshing")
                 bundle_sha = _deploy_and_setup(
-                    client, machine_id, spec, api_key, full_setup=True, log=log
+                    client, machine_id, spec, api_key, full_setup=False, log=log
                 )
                 _registry_set(spec.name, machine_id, bundle_sha)
-            else:
-                _, current_sha = _build_bundle(spec)
-                if current_sha != bundle_sha:
-                    log("Server files changed — refreshing bundle...")
-                    _emit(spec.name, "refreshing server files…", phase="refreshing")
-                    bundle_sha = _deploy_and_setup(
-                        client, machine_id, spec, api_key, full_setup=False, log=log
-                    )
-                    _registry_set(spec.name, machine_id, bundle_sha)
 
-        base_url = _ensure_preview(client, machine_id, spec, log=log)
-        _emit(spec.name, "ready", phase="running", machine_id=machine_id)
+    base_url = _ensure_preview(client, machine_id, spec, log=log)
+    _emit(spec.name, "ready", phase="running", machine_id=machine_id)
 
     return MachineHandle(
         spec=spec,
@@ -776,23 +757,7 @@ def ephemeral_machine(
     and nothing is reused, so untrusted code executed on it has no lasting
     blast radius. Never touches the registry.
     """
-    # Deferred: orchestrator/__init__ imports modules that import this module.
-    from obsidian_agent.orchestrator.config import _load_api_key
-
     api_key = _load_api_key()
-
-    override = os.getenv(f"OBSIDIAN_MACHINE_URL_{spec.name.upper()}", "").strip()
-    if override:
-        yield MachineHandle(
-            spec=spec,
-            machine_id=f"local-{spec.name}",
-            base_url=override.rstrip("/"),
-            client=None,
-            api_key=api_key,
-            reused=True,
-        )
-        return
-
     client = Dedalus(api_key=api_key)
     _retire_registry_machine(spec.name, client, log=log)
 
@@ -924,8 +889,6 @@ def tail_server_log(
     log: Callable[[str], None] = print,
 ) -> None:
     """Print the tail of the machine server's log (best effort, post-mortem)."""
-    if handle.client is None:
-        return
     try:
         out, err = run_command(
             handle.client, handle.machine_id,
@@ -949,9 +912,6 @@ def tail_server_log(
 
 def delete_all_machines() -> list[str]:
     """Destroy all non-destroyed machines in the org and clear the registry."""
-    # Deferred: orchestrator/__init__ imports modules that import this module.
-    from obsidian_agent.orchestrator.config import _load_api_key
-
     print("Deleting all machines...")
     client = Dedalus(api_key=_load_api_key())
     deleted: list[str] = []
@@ -970,10 +930,9 @@ def delete_all_machines() -> list[str]:
     except Exception as exc:
         print(f"Warning during delete: {exc}")
 
-    with _REGISTRY_LOCK:
-        reg = _registry_load()
-        reg["machines"] = {}
-        _registry_save(reg)
+    reg = _registry_load()
+    reg["machines"] = {}
+    _registry_save(reg)
 
     print(f"Deleted {len(deleted)} machine(s)")
     return deleted

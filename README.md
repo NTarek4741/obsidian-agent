@@ -2,7 +2,7 @@
 
 > Created as an ambassador for Dedalus Labs — check out [https://dedaluslabs.ai](https://dedaluslabs.ai/?utm_source=ambassador&utm_medium=referral&utm_campaign=ambassador_program&utm_content=tarek).
 
-A Dedalus-powered desktop workbench for your Obsidian vault. ObsidianAgent ships a polished terminal UI (Ink + React + TypeScript) sitting on top of a FastAPI backend that orchestrates six specialised AI agents — fast research, deep research, transcription, mind-mapping, podcast generation, and Anki flashcards — all writing directly into your local vault.
+A Dedalus-powered desktop workbench for your Obsidian vault. ObsidianAgent ships a polished terminal UI (Go + Bubble Tea) sitting on top of a FastAPI backend that orchestrates six specialised AI agents — fast research, deep research, transcription, mind-mapping, podcast generation, and Anki flashcards — all writing directly into your local vault.
 
 ## Introduction
 
@@ -12,7 +12,7 @@ The architecture cleanly separates three concerns:
 
 1. **Machine servers** (`obsidian_agent/orchestrator/<machine>/server_setup/`) — each of the three Dedalus VMs is described entirely by one self-contained folder: a `server.py` (the agents themselves — personas, prompts, pipelines, tools), its supporting modules, and a `setup.sh` that bootstraps the VM. Nothing agent-related runs locally.
 2. **Machines** (`obsidian_agent/machine.py`) — the single owner of the Dedalus VM lifecycle. All six agents execute on three persistent Dedalus machines: `podcast` (1 agent), `flashcard` (1 agent), and `utility` (transcription + fast research + deep research + mind map behind one FastAPI server). `machine.py` tars each machine's entire `server_setup/` directory into a deterministic bundle, finds/wakes/creates the VM, deploys the bundle, and keeps deployed files in sync via a content hash.
-3. **Surfaces** — a FastAPI HTTP API (`api/app.py`) that routes every agent endpoint through one dispatch table of thin async machine clients (`orchestrator/<machine>/client.py`), and an Ink-based TUI (`tui/`) that calls it.
+3. **Surfaces** — a FastAPI HTTP API (`api/app.py`) that routes every agent endpoint through one dispatch table of thin async machine clients (`orchestrator/<machine>/client.py`), and a Go TUI built on Bubble Tea (`tui-go/`) that calls it.
 
 Every agent request returns a `job_id`; the TUI polls `/jobs/{job_id}` and renders progress live in its sidebar. For the utility machine, jobs also run machine-side: the local API polls the machine's own `/jobs/{id}` endpoint, mirrors its progress lines into the local job, and writes the returned deliverables (new/changed vault files) into your local vault.
 
@@ -45,12 +45,14 @@ ObsidianAgent/
 │       └── flashcard/               # Note → Anki .apkg deck (Dedalus VM)
 │           ├── client.py
 │           └── server_setup/
-└── tui/                             # Ink + React + TypeScript terminal UI
-    ├── src/
-    │   ├── components/              # App, Sidebar, Viewport, ConfigWizard, JobBox, ...
-    │   ├── hooks/                   # useBackend, useJobs, useCommands, useHistory, useEnv
-    │   └── api/                     # Backend HTTP client + live microphone recorder
-    └── dist/                        # Compiled entry point (node dist/index.js)
+└── tui-go/                          # Go terminal UI (Bubble Tea + Lip Gloss + Glamour)
+    ├── main.go                      # Entry point: flags, .env discovery, alt-screen program
+    └── internal/
+        ├── ui/                      # Root model, layout, viewport, sidebar, slash menu, wizard
+        ├── api/                     # Backend HTTP client
+        ├── theme/                   # Obsidian-flavored dark palette
+        ├── recorder/                # ffmpeg live microphone recorder
+        └── history/                 # Persistent command history
 ```
 
 ## Prerequisites
@@ -58,12 +60,12 @@ ObsidianAgent/
 | Requirement | Notes |
 |-------------|-------|
 | **Python 3.13+** | Backend runtime |
-| **Node.js 18+** | TUI runtime |
+| **Go 1.22+** | TUI build toolchain (`brew install go`) |
 | [`uv`](https://github.com/astral-sh/uv) | Python package manager used by `pyproject.toml` |
 | **Dedalus API key** | Get one at [dedaluslabs.ai/dashboard/api-keys](https://dedaluslabs.ai/dashboard/api-keys) |
 | **Obsidian vault** | Absolute path to a local vault. The agent works inside an auto-created `agent/` subfolder. |
 
-The TUI bundles its own `ffmpeg` binary via `@ffmpeg-installer/ffmpeg`, so live microphone recording works without a system install.
+Live microphone recording uses the system `ffmpeg` (`brew install ffmpeg`); everything else works without it.
 
 ## Setup
 
@@ -74,14 +76,10 @@ cd ObsidianAgent
 uv pip install -e .
 ```
 
-### 2. Build the TUI
+### 2. The TUI builds itself
 
-```bash
-cd tui
-npm install
-npm run build
-cd ..
-```
+The TUI is a single Go binary that `main.py` builds automatically on first
+launch (and rebuilds whenever the Go sources change) — no separate build step.
 
 ### 3. Configure credentials
 
@@ -108,10 +106,10 @@ OBSIDIAN_AGENT_TIMEOUT=1800   # Dedalus agent run timeout in seconds (default 18
 uv run main.py
 ```
 
-This spawns:
+This builds the TUI binary if missing or stale, then spawns:
 
 - `uvicorn api.app:app --port 8000` (the backend)
-- `node tui/dist/index.js` (the TUI)
+- `tui-go/obsidian-tui` (the TUI)
 
 Quitting the TUI cleanly terminates the backend.
 
@@ -247,7 +245,7 @@ Models, MCP servers, and persona behaviour are configured per-agent inside each 
 - **Mind-map fidelity.** The mind-map agent treats the source note as authoritative — web research only contributes sources and a learning path, never replacement content.
 - **VM hygiene.** All three machines (podcast, flashcard, utility) rely on Dedalus autosleep (30 min idle window) rather than per-request destroy. Machine ids and deployed-bundle hashes are persisted in `obsidian_agent/machines.json` so warm reuse survives TUI restarts, and code changes to any `server_setup/` bundle auto-redeploy on the next request. `DELETE /machines` is a manual hard-reset that destroys every non-destroyed machine in the org — useful when a VM gets into a broken state or you want to force a fresh build.
 - **Utility machine vault.** The utility VM keeps its own vault at `/home/machine/vault` that persists across jobs and sleeps. Job inputs are uploaded into it, agent outputs are written to it, and only the files created/changed by a job are shipped back and merged into your local vault — your local vault remains the source of truth.
-- **Live recording.** The TUI uses a bundled `ffmpeg` to capture from the default input device, validates the file is non-empty, then uploads it through the same `/transcribe` endpoint as a file path.
+- **Live recording.** The TUI uses the system `ffmpeg` to capture from the default input device, validates the file is non-empty, then uploads it through the same `/transcribe` endpoint as a file path.
 
 ## License
 

@@ -22,11 +22,11 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
-import threading
 import time
 from pathlib import Path
 from typing import Callable
 
+from obsidian_agent.config import _ensure_vault_path
 from obsidian_agent.machine import MachineHandle, _emit, request
 
 _CACHE_FILE = Path(__file__).parent / "sync_cache.json"
@@ -39,8 +39,6 @@ _VAULT_SYNC_PATH = (
 _vs_spec = importlib.util.spec_from_file_location("_obsidian_vault_sync", _VAULT_SYNC_PATH)
 vault_sync = importlib.util.module_from_spec(_vs_spec)
 _vs_spec.loader.exec_module(vault_sync)
-
-_SYNC_LOCK = threading.Lock()
 
 
 def _load_cache() -> dict:
@@ -72,52 +70,51 @@ def build_local_manifest(root: Path) -> dict[str, str]:
 def sync_agent_folder(
     handle: MachineHandle, *, log: Callable[[str], None] = print
 ) -> dict:
-    """Mirror <local vault>/agent onto the machine. Returns sync stats."""
-    # Deferred: orchestrator/__init__ imports modules that import this module.
-    from obsidian_agent.orchestrator.config import _ensure_vault_path
+    """Mirror <local vault>/agent onto the machine. Returns sync stats.
 
+    No locking: sync only ever runs inside the single gated job.
+    """
     name = handle.spec.name
     agent_root = Path(_ensure_vault_path())
 
-    with _SYNC_LOCK:
-        t0 = time.monotonic()
-        local = build_local_manifest(agent_root)
-        local_root = vault_sync.root_hash(local)
+    t0 = time.monotonic()
+    local = build_local_manifest(agent_root)
+    local_root = vault_sync.root_hash(local)
 
-        resp = request(handle, "GET", "/vault-manifest", timeout=120.0, log=log)
-        remote = resp.json()
-        if remote.get("root") == local_root:
-            took = round(time.monotonic() - t0, 2)
-            log(f"● Vault in sync ({len(local)} files, {took:.1f}s)")
-            _emit(name, f"vault in sync ({len(local)} files)",
-                  sync={"files": len(local), "uploaded": 0, "deleted": 0,
-                        "took_s": took, "at": time.time()})
-            return {"in_sync": True, "files": len(local), "uploaded": 0, "deleted": 0}
-
-        remote_files: dict[str, str] = remote.get("files") or {}
-        writes = {
-            rel: base64.b64encode((agent_root / rel).read_bytes()).decode("ascii")
-            for rel, sha in local.items()
-            if remote_files.get(rel) != sha
-        }
-        deletes = sorted(set(remote_files) - set(local))
-
-        log(f"● Syncing vault: ↑{len(writes)} changed, ✕{len(deletes)} removed…")
-        resp = request(
-            handle, "POST", "/vault-sync",
-            json_body={"writes": writes, "deletes": deletes},
-            timeout=600.0, log=log,
-        )
-        new_root = resp.json().get("root")
-        if new_root != local_root:
-            raise RuntimeError(
-                f"Vault sync verification failed: machine root {new_root!r} "
-                f"!= local root {local_root!r}"
-            )
+    resp = request(handle, "GET", "/vault-manifest", timeout=120.0, log=log)
+    remote = resp.json()
+    if remote.get("root") == local_root:
         took = round(time.monotonic() - t0, 2)
-        log(f"● Vault synced ({len(local)} files, ↑{len(writes)}, ✕{len(deletes)}, {took:.1f}s)")
-        _emit(name, f"synced ↑{len(writes)} ✕{len(deletes)} ({len(local)} files)",
-              sync={"files": len(local), "uploaded": len(writes),
-                    "deleted": len(deletes), "took_s": took, "at": time.time()})
-        return {"in_sync": False, "files": len(local),
-                "uploaded": len(writes), "deleted": len(deletes)}
+        log(f"● Vault in sync ({len(local)} files, {took:.1f}s)")
+        _emit(name, f"vault in sync ({len(local)} files)",
+              sync={"files": len(local), "uploaded": 0, "deleted": 0,
+                    "took_s": took, "at": time.time()})
+        return {"in_sync": True, "files": len(local), "uploaded": 0, "deleted": 0}
+
+    remote_files: dict[str, str] = remote.get("files") or {}
+    writes = {
+        rel: base64.b64encode((agent_root / rel).read_bytes()).decode("ascii")
+        for rel, sha in local.items()
+        if remote_files.get(rel) != sha
+    }
+    deletes = sorted(set(remote_files) - set(local))
+
+    log(f"● Syncing vault: ↑{len(writes)} changed, ✕{len(deletes)} removed…")
+    resp = request(
+        handle, "POST", "/vault-sync",
+        json_body={"writes": writes, "deletes": deletes},
+        timeout=600.0, log=log,
+    )
+    new_root = resp.json().get("root")
+    if new_root != local_root:
+        raise RuntimeError(
+            f"Vault sync verification failed: machine root {new_root!r} "
+            f"!= local root {local_root!r}"
+        )
+    took = round(time.monotonic() - t0, 2)
+    log(f"● Vault synced ({len(local)} files, ↑{len(writes)}, ✕{len(deletes)}, {took:.1f}s)")
+    _emit(name, f"synced ↑{len(writes)} ✕{len(deletes)} ({len(local)} files)",
+          sync={"files": len(local), "uploaded": len(writes),
+                "deleted": len(deletes), "took_s": took, "at": time.time()})
+    return {"in_sync": False, "files": len(local),
+            "uploaded": len(writes), "deleted": len(deletes)}

@@ -65,5 +65,8 @@ agent/
 machines.json
 sync_cache.json
 
+# Go TUI binary (built on launch by main.py)
+tui-go/obsidian-tui
+
 # Keep uv.lock in repo for reproducible builds
 # uv.lock

@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from obsidian_agent.orchestrator.config import _ensure_vault_path
+from obsidian_agent.config import _ensure_vault_path
 
 # ---------------------------------------------------------------------------
 # Job system
@@ -41,7 +41,26 @@ def _fire(coro):
     return t
 
 
+def _active_job() -> Job | None:
+    return next(
+        (j for j in _jobs.values() if j.status in ("pending", "running")), None
+    )
+
+
 def _new_job(kind: str) -> Job:
+    """Create a job, enforcing the one-job-at-a-time rule for the vault.
+
+    The whole backend runs at most one worker thread because of this gate:
+    every agent endpoint funnels through here on the event-loop thread, so
+    no lock is needed to make the check atomic.
+    """
+    active = _active_job()
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=f"job {active.job_id} ({active.kind}) is still running — "
+                   f"one job at a time",
+        )
     job = Job(job_id=str(uuid.uuid4())[:8], kind=kind)
     _jobs[job.job_id] = job
     return job

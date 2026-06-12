@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from obsidian_agent.orchestrator.config import _ensure_vault_path
+from obsidian_agent.config import _ensure_vault_path
 
 # ---------------------------------------------------------------------------
 # Job system

@@ -12,13 +12,18 @@ from __future__ import annotations
 
 import asyncio
 import os
-import threading
 from pathlib import Path
 
+import uvicorn
 from dotenv import load_dotenv, set_key
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from obsidian_agent.machine import (
+    delete_all_machines,
+    machine_status,
+    refresh_machine_phases,
+)
 from obsidian_agent.orchestrator import AGENT_CLIENTS
 
 from api.utils import (
@@ -28,6 +33,7 @@ from api.utils import (
     TranscribeRequest,
     TopicRequest,
     NotePathRequest,
+    _active_job,
     _jobs,
     _fire,
     _new_job,
@@ -170,52 +176,26 @@ async def get_job(job_id: str):
 async def machines():
     """Lifecycle snapshot of every Dedalus machine for the TUI panel.
 
-    Returns the in-process state immediately; real phases are refreshed from
-    the Dedalus API in the background at most once per 60s, so TUI polling
-    stays cheap while autosleep transitions still show up.
+    Real phases are refreshed from the Dedalus API at most once per 60s
+    (rate-limited inside refresh_machine_phases), so TUI polling stays cheap
+    while autosleep transitions still show up.
     """
-    from obsidian_agent.machine import machine_status, refresh_machine_phases
-
     if is_configured():
-        threading.Thread(target=refresh_machine_phases, daemon=True).start()
+        await asyncio.to_thread(refresh_machine_phases)
     return machine_status()
 
 
 @app.delete("/machines")
 async def delete_machines():
-    from obsidian_agent.machine import delete_all_machines
+    active = _active_job()
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=f"job {active.job_id} ({active.kind}) is still running — "
+                   f"machines cannot be deleted mid-job",
+        )
     deleted = await asyncio.to_thread(delete_all_machines)
     return {"deleted": len(deleted), "machine_ids": deleted}
-
-
-# ---------------------------------------------------------------------------
-# Startup: mirror the local agent/ folder onto the utility machine
-# ---------------------------------------------------------------------------
-
-
-def _startup_sync_worker() -> None:
-    """Ensure the utility machine and sync the agent corpus (background).
-
-    Progress is silent here on purpose — every step lands in the machine
-    state surface via _emit(), which the TUI's machines panel renders live.
-    """
-    from obsidian_agent.machine import _emit, ensure_machine, get_spec
-    from obsidian_agent.sync import sync_agent_folder
-
-    try:
-        handle = ensure_machine(get_spec("utility"), log=lambda _line: None)
-        sync_agent_folder(handle, log=lambda _line: None)
-    except Exception as exc:
-        _emit("utility", f"startup sync failed: {exc}", phase="error")
-
-
-@app.on_event("startup")
-async def startup_vault_sync():
-    if os.getenv("OBSIDIAN_SYNC_ON_START", "1").strip().lower() in ("0", "false", "no"):
-        return
-    if not is_configured():
-        return
-    _fire(asyncio.to_thread(_startup_sync_worker))
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +204,6 @@ async def startup_vault_sync():
 
 
 def start():
-    import uvicorn
     uvicorn.run("api.app:app", host="0.0.0.0", port=8000, reload=False)
 
 

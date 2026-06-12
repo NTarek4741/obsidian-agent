@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath
 
 import httpx
 from dedalus_labs import AsyncDedalus
+from youtube_transcript_api import YouTubeTranscriptApi
 
 from api.utils import Job
 from obsidian_agent.machine import (
@@ -33,7 +34,7 @@ from obsidian_agent.machine import (
     request,
     tail_server_log,
 )
-from obsidian_agent.orchestrator.config import _ensure_vault_path, _load_api_key
+from obsidian_agent.config import _ensure_vault_path, _load_api_key
 from obsidian_agent.sync import sync_agent_folder
 
 POLL_INTERVAL_S = 2.0
@@ -99,8 +100,6 @@ def _fetch_youtube_transcript(url: str) -> tuple[str, str]:
     from datacenter IPs (which the VM has), but not residential ones. Title
     and channel come from YouTube's keyless oEmbed endpoint, best effort.
     """
-    from youtube_transcript_api import YouTubeTranscriptApi
-
     m = _YOUTUBE_ID_RE.search(url)
     if not m:
         raise ValueError(f"Could not extract a YouTube video ID from: {url}")

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from api.utils import Job
 from obsidian_agent.machine import ensure_machine, get_spec, request, tail_server_log
-from obsidian_agent.orchestrator.config import _ensure_vault_path
+from obsidian_agent.config import _ensure_vault_path
 
 
 async def generate_podcast(note_path: str, note_content: str, job: Job) -> dict:
