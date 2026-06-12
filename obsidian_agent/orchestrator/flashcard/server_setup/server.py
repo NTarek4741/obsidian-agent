@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from pathlib import Path
 
 import uvicorn
 from dedalus_labs import AsyncDedalus, DedalusRunner
@@ -35,7 +36,8 @@ app = FastAPI()
 API_KEY = os.environ.get("DEDALUS_API_KEY", "")
 MODEL = "anthropic/claude-sonnet-4-20250514"
 
-FLASHCARD_SYSTEM_PROMPT = """SYSTEM_PROMPT_PLACEHOLDER"""
+# Deployed alongside this file by the machine.py bundle.
+FLASHCARD_SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text(encoding="utf-8")
 
 MAX_AGENT_STEPS = 20
 MAX_OUTPUT_CHARS = 2000

@@ -6,6 +6,7 @@ import type {
   TopicReq,
   NotePathReq,
   JobStatusResp,
+  MachinesResp,
 } from "../types/index.js";
 
 export class APIClient {
@@ -67,6 +68,14 @@ export class APIClient {
 
   startTranscribe(content: string): Promise<JobResp> {
     return this.postJSON<JobResp>("/transcribe", { content });
+  }
+
+  startChat(question: string): Promise<JobResp> {
+    return this.postJSON<JobResp>("/chat", { question });
+  }
+
+  getMachines(): Promise<MachinesResp> {
+    return this.getJSON<MachinesResp>("/machines");
   }
 
   pollJob(jobID: string): Promise<JobStatusResp> {

@@ -62,6 +62,8 @@ htmlcov/
 agent/
 *.canvas
 .machine_state.json
+machines.json
+sync_cache.json
 
 # Keep uv.lock in repo for reproducible builds
 # uv.lock

@@ -48,6 +48,40 @@ export interface JobStatusResp {
   error: string | null;
 }
 
+// ─── Machine state surface (GET /machines) ───────────────────────────────
+
+export interface MachineSyncStats {
+  files: number;
+  uploaded: number;
+  deleted: number;
+  took_s: number;
+  at: number; // epoch seconds
+}
+
+export interface MachineInfo {
+  name: string;
+  lifecycle: "persistent" | "ephemeral";
+  resources: string;
+  autosleep: string;
+  machine_id: string | null;
+  phase: string;
+  last_event: string | null;
+  last_event_ts: number | null; // epoch seconds
+  wake_seconds: number | null;
+  sync: MachineSyncStats | null;
+}
+
+export interface MachineEvent {
+  ts: number; // epoch seconds
+  machine: string;
+  event: string;
+}
+
+export interface MachinesResp {
+  machines: MachineInfo[];
+  events: MachineEvent[];
+}
+
 export type JobKind =
   | "podcast"
   | "flashcard"

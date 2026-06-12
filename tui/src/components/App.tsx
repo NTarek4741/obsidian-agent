@@ -5,6 +5,7 @@ import { useBackend } from "../hooks/useBackend.js";
 import { useJobs, extractResultText } from "../hooks/useJobs.js";
 import { useCommands } from "../hooks/useCommands.js";
 import { useHistory } from "../hooks/useHistory.js";
+import { useMachines } from "../hooks/useMachines.js";
 import { getSlashHits } from "../components/SlashMenu.js";
 import { Viewport } from "../components/Viewport.js";
 import { Sidebar } from "../components/Sidebar.js";
@@ -56,6 +57,7 @@ export function App({ backendURL }: AppProps) {
   const welcomeShownRef = useRef(false);
 
   const { state: backendState, checkHealth, client } = useBackend(backendURL, true);
+  const machines = useMachines(client, backendState.connected);
 
   // ─── Item helpers (declared early so useJobs callback can use them) ───
   const pushItem = useCallback((item: ContentItem) => {
@@ -283,16 +285,17 @@ export function App({ backendURL }: AppProps) {
           break;
         case "help": {
           const cmds = [
+            "/chat <question>          Ask your synced agent vault",
             "/podcast <note-path>      Generate WAV podcast from note",
-            "/flashcard <note-path>    Generate Anki deck from note",
+            "/flashcard <note-path>    Generate Anki deck (ephemeral sandbox)",
             "/transcribe <file>        Transcribe audio/video file",
             "/transcribe yt <url>      Transcribe YouTube video",
             "/transcribe live          Start microphone recording",
             "/research fast <topic>    Quick research note",
             "/research deep <topic>    Deep research (plan + build)",
             "/mindmap <note-path>      Create mind map from note",
+            "/machines                 Show Dedalus machine status",
             "/config                   Setup API key + vault path",
-            "/jobs                     Show active/recent jobs",
             "/clear                    Clear the output area",
             "/help                     Show all commands",
             "/quit                     Quit",
@@ -413,6 +416,7 @@ export function App({ backendURL }: AppProps) {
         connected={backendState.connected}
         vault={backendState.vault}
         recentJobs={recentJobs}
+        machines={machines}
         width={SIDEBAR_WIDTH}
         height={height}
         sessionStartedAt={sessionStartedAtRef.current}

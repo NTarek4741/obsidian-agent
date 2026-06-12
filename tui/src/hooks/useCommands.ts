@@ -1,21 +1,47 @@
 import { useCallback } from "react";
 import type { APIClient } from "../api/client.js";
-import type { SlashCmd } from "../types/index.js";
+import type { MachinesResp, SlashCmd } from "../types/index.js";
 
 export const ALL_SLASH_COMMANDS: SlashCmd[] = [
+  { cmd: "/chat", meta: "<question>       Ask your synced agent vault" },
   { cmd: "/podcast", meta: "<note-path>      Generate WAV podcast from note" },
-  { cmd: "/flashcard", meta: "<note-path>      Generate Anki deck from note" },
+  { cmd: "/flashcard", meta: "<note-path>      Generate Anki deck (ephemeral sandbox)" },
   { cmd: "/transcribe", meta: "<file-path>      Transcribe audio/video file" },
   { cmd: "/transcribe yt", meta: "<url>            Transcribe YouTube video" },
   { cmd: "/transcribe live", meta: "                 Start microphone recording" },
   { cmd: "/research fast", meta: "<topic>          Quick research note" },
   { cmd: "/research deep", meta: "<topic>          Deep research (plan + build)" },
   { cmd: "/mindmap", meta: "<note-path>      Create mind map from note" },
+  { cmd: "/machines", meta: "                 Show Dedalus machine status" },
   { cmd: "/config", meta: "                 Setup API key + vault path" },
   { cmd: "/clear", meta: "                 Clear the output area" },
   { cmd: "/help", meta: "                 Show all commands" },
   { cmd: "/quit", meta: "                 Quit" },
 ];
+
+function formatMachines(resp: MachinesResp): string {
+  const lines: string[] = ["**Dedalus machines**", "", "```"];
+  for (const m of resp.machines) {
+    lines.push(
+      `${m.name.padEnd(10)} ${m.lifecycle.padEnd(11)} ${m.phase.padEnd(11)} ${m.resources}`
+    );
+    let detail = `           id: ${m.machine_id ?? "—"}   autosleep: ${m.autosleep}`;
+    if (m.wake_seconds != null) detail += `   last wake: ${m.wake_seconds}s`;
+    lines.push(detail);
+    if (m.last_event) lines.push(`           ${m.last_event}`);
+  }
+  lines.push("```");
+  const events = resp.events.slice(0, 8);
+  if (events.length > 0) {
+    lines.push("", "**Recent events**", "", "```");
+    for (const e of events) {
+      const t = new Date(e.ts * 1000).toTimeString().slice(0, 8);
+      lines.push(`${t}  ${e.machine.padEnd(10)} ${e.event}`);
+    }
+    lines.push("```");
+  }
+  return lines.join("\n");
+}
 
 export type CommandResult =
   | { type: "message"; text: string }
@@ -51,6 +77,27 @@ export function useCommands(
       const results: CommandResult[] = [];
 
       switch (verb) {
+        case "chat": {
+          if (!args) return [{ type: "message", text: "Usage: /chat <question>" }];
+          try {
+            const resp = await client.startChat(args);
+            results.push({ type: "job_start", kind: "chat", jobID: "", realID: resp.job_id });
+          } catch (e) {
+            results.push({ type: "message", text: `Chat failed: ${e}` });
+          }
+          break;
+        }
+
+        case "machines": {
+          try {
+            const resp = await client.getMachines();
+            results.push({ type: "message", text: formatMachines(resp) });
+          } catch (e) {
+            results.push({ type: "message", text: `Failed to fetch machines: ${e}` });
+          }
+          break;
+        }
+
         case "podcast": {
           if (!args) return [{ type: "message", text: "Usage: /podcast <note-path>" }];
           try {

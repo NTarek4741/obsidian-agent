@@ -1,7 +1,8 @@
 """FastAPI backend server for ObsidianAgent.
 
-Each orchestrator is exposed as a separate endpoint. Long-running operations
-return a job_id that can be polled via GET /jobs/{job_id}.
+A thin unified router: every agent endpoint resolves its inputs, then
+dispatches to the agent's machine client via AGENT_CLIENTS. Long-running
+operations return a job_id that can be polled via GET /jobs/{job_id}.
 
 Run:
     uv run uvicorn api.app:app --port 8000
@@ -11,25 +12,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv, set_key
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from obsidian_agent.orchestrator import (
-    deep_research_execute,
-    deep_research_plan,
-    fast_research_orchestration,
-    generate_flashcards,
-    generate_podcast,
-    mind_map_generate,
-)
-from obsidian_agent.orchestrator.transcription.orchestration import transcribe_auto
+from obsidian_agent.orchestrator import AGENT_CLIENTS
 
 from api.utils import (
-    Job,
     JobResponse,
+    ChatRequest,
     ConfigRequest,
     TranscribeRequest,
     TopicRequest,
@@ -94,92 +88,57 @@ async def configure(req: ConfigRequest):
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Agent endpoints — one dispatch for all six clients
 # ---------------------------------------------------------------------------
+
+
+def _dispatch(kind: str, *inputs) -> dict:
+    """Start the agent's machine client as a polled job."""
+    require_configured()
+    job = _new_job(kind)
+    _fire(_run_job(job, AGENT_CLIENTS[kind](*inputs, job)))
+    return {"job_id": job.job_id}
 
 
 @app.post("/transcribe", response_model=JobResponse)
 async def transcribe_endpoint(req: TranscribeRequest):
-    require_configured()
-    job = _new_job("transcribe")
-
-    async def _coro():
-        result = await transcribe_auto(req.content, on_progress=job.progress.append)
-        final = str(result.final_output) if hasattr(result, "final_output") else str(result)
-        return {"output": final}
-
-    _fire(_run_job(job, _coro()))
-    return {"job_id": job.job_id}
+    return _dispatch("transcribe", req.content)
 
 
 @app.post("/research/fast", response_model=JobResponse)
 async def fast_research(req: TopicRequest):
-    require_configured()
-    job = _new_job("research_fast")
+    return _dispatch("research_fast", req.topic)
 
-    async def _coro():
-        job.progress.append("Running research agent…")
-        messages = [{"role": "user", "content": req.topic}]
-        result = await fast_research_orchestration(messages)
-        final = str(result.final_output) if hasattr(result, "final_output") else str(result)
-        return {"result": final}
 
-    _fire(_run_job(job, _coro()))
-    return {"job_id": job.job_id}
+@app.post("/research/deep", response_model=JobResponse)
+async def deep_research(req: TopicRequest):
+    return _dispatch("deep_research", req.topic)
 
 
 @app.post("/mind-map", response_model=JobResponse)
 async def mind_map(req: NotePathRequest):
     require_configured()
-    note_path, note_content = resolve_note_path(req.note_path)
-    job = _new_job("mind_map")
-
-    async def _coro():
-        job.progress.append("Generating mind map…")
-        return await mind_map_generate(note_path, note_content)
-
-    _fire(_run_job(job, _coro()))
-    return {"job_id": job.job_id}
-
-
-@app.post("/research/deep", response_model=JobResponse)
-async def deep_research(req: TopicRequest):
-    require_configured()
-    job = _new_job("deep_research")
-
-    async def _coro():
-        messages = [{"role": "user", "content": req.topic}]
-        plan_result = await deep_research_plan(messages)
-        if plan_result.get("error"):
-            raise RuntimeError(f"Planning failed: {plan_result['error']}")
-        plan = plan_result["plan"]
-        exec_result = await deep_research_execute(plan)
-        return {
-            "plan": plan,
-            "verified": exec_result.get("verified", False),
-            "missing_files": exec_result.get("missing_files", []),
-        }
-
-    _fire(_run_job(job, _coro(), capture_stdout=True))
-    return {"job_id": job.job_id}
+    note_path, _note_content = resolve_note_path(req.note_path)
+    return _dispatch("mind_map", note_path)
 
 
 @app.post("/podcast", response_model=JobResponse)
 async def podcast(req: NotePathRequest):
     require_configured()
     note_path, note_content = resolve_note_path(req.note_path)
-    job = _new_job("podcast")
-    _fire(_run_job(job, asyncio.to_thread(generate_podcast, note_path, note_content), capture_stdout=True))
-    return {"job_id": job.job_id}
+    return _dispatch("podcast", note_path, note_content)
 
 
 @app.post("/flashcard", response_model=JobResponse)
 async def flashcard(req: NotePathRequest):
     require_configured()
     note_path, note_content = resolve_note_path(req.note_path)
-    job = _new_job("flashcard")
-    _fire(_run_job(job, asyncio.to_thread(generate_flashcards, note_path, note_content), capture_stdout=True))
-    return {"job_id": job.job_id}
+    return _dispatch("flashcard", note_path, note_content)
+
+
+@app.post("/chat", response_model=JobResponse)
+async def chat(req: ChatRequest):
+    return _dispatch("chat", req.question)
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +162,60 @@ async def get_job(job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Machine cleanup
+# Machine state surface
 # ---------------------------------------------------------------------------
+
+
+@app.get("/machines")
+async def machines():
+    """Lifecycle snapshot of every Dedalus machine for the TUI panel.
+
+    Returns the in-process state immediately; real phases are refreshed from
+    the Dedalus API in the background at most once per 60s, so TUI polling
+    stays cheap while autosleep transitions still show up.
+    """
+    from obsidian_agent.machine import machine_status, refresh_machine_phases
+
+    if is_configured():
+        threading.Thread(target=refresh_machine_phases, daemon=True).start()
+    return machine_status()
 
 
 @app.delete("/machines")
 async def delete_machines():
-    from obsidian_agent.orchestrator import delete_all_machines
+    from obsidian_agent.machine import delete_all_machines
     deleted = await asyncio.to_thread(delete_all_machines)
     return {"deleted": len(deleted), "machine_ids": deleted}
+
+
+# ---------------------------------------------------------------------------
+# Startup: mirror the local agent/ folder onto the utility machine
+# ---------------------------------------------------------------------------
+
+
+def _startup_sync_worker() -> None:
+    """Ensure the utility machine and sync the agent corpus (background).
+
+    Progress is silent here on purpose — every step lands in the machine
+    state surface via _emit(), which the TUI's machines panel renders live.
+    """
+    from obsidian_agent.machine import _emit, ensure_machine, get_spec
+    from obsidian_agent.sync import sync_agent_folder
+
+    try:
+        handle = ensure_machine(get_spec("utility"), log=lambda _line: None)
+        sync_agent_folder(handle, log=lambda _line: None)
+    except Exception as exc:
+        _emit("utility", f"startup sync failed: {exc}", phase="error")
+
+
+@app.on_event("startup")
+async def startup_vault_sync():
+    if os.getenv("OBSIDIAN_SYNC_ON_START", "1").strip().lower() in ("0", "false", "no"):
+        return
+    if not is_configured():
+        return
+    _fire(asyncio.to_thread(_startup_sync_worker))
 
 
 # ---------------------------------------------------------------------------

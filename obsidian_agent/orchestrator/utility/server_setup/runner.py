@@ -1,15 +1,17 @@
 """
-Generic agent runner for the Obsidian Agent.
+Generic agent runner for the utility server.
 
-Loads credentials, resolves the vault path, binds tools, executes silently.
+Reads credentials and the vault path from the environment (populated by
+/etc/utility-server.env on the machine), binds tools, executes silently.
 All output is deferred to the caller via the returned result object.
 """
 
 import os
 from functools import wraps
+from pathlib import Path
 
 from dedalus_labs import AsyncDedalus, DedalusRunner
-from pydantic_core.core_schema import json_schema
+
 
 class Persona:
     """A task-specific persona for the Obsidian Agent."""
@@ -45,6 +47,23 @@ class Persona:
 AGENT_TIMEOUT = int(os.getenv("OBSIDIAN_AGENT_TIMEOUT", "1800"))
 
 
+def _api_key() -> str:
+    key = os.environ.get("DEDALUS_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("DEDALUS_API_KEY must be set in the environment")
+    return key
+
+
+def agent_dir() -> str:
+    """The agent sandbox: <OBSIDIAN_VAULT_PATH>/agent (created on demand)."""
+    vault = os.environ.get("OBSIDIAN_VAULT_PATH", "").strip()
+    if not vault:
+        raise RuntimeError("OBSIDIAN_VAULT_PATH must be set in the environment")
+    d = Path(vault) / "agent"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
 def _bind_tools(tools: list, vault_path: str):
     """Bind vault_path as the first argument of every tool function."""
 
@@ -65,13 +84,9 @@ async def run_persona(persona: Persona, messages: list):
     Returns the Dedalus runner result for post-processing.
     """
 
-    from obsidian_agent.orchestrator.utility import _load_api_key, _ensure_vault_path
-    api_key = _load_api_key()
-    vault_path = _ensure_vault_path()
+    bound_tools = _bind_tools(persona.tools, agent_dir())
 
-    bound_tools = _bind_tools(persona.tools, vault_path)
-
-    client = AsyncDedalus(api_key=api_key, timeout=AGENT_TIMEOUT)
+    client = AsyncDedalus(api_key=_api_key(), timeout=AGENT_TIMEOUT)
     runner = DedalusRunner(client)
 
     run_kwargs = {

@@ -1,45 +1,8 @@
-from . import tools
-from . import agent
+"""ObsidianAgent — local clients + machine lifecycle for Dedalus-hosted agents.
 
-from .tools import (
-    canvas_critique_verdict,
-    vault_read,
-    vault_write,
-    vault_append,
-    vault_delete,
-    vault_list,
-    vault_exists,
-    vault_search,
-    vault_grep,
-    vault_get_metadata,
-    vault_get_tags,
-    vault_get_links,
-    vault_get_backlinks,
-    vault_write_canvas,
-)
+Agent logic lives inside each machine's server_setup/ bundle
+(obsidian_agent/orchestrator/<machine>/server_setup/); this package holds the
+machine lifecycle (machine.py) and the thin local clients (orchestrator/).
+"""
 
-from .agent import (
-    Persona,
-    run_persona,
-)
-
-__all__ = [
-    "tools",
-    "agent",
-    "vault_read",
-    "vault_write",
-    "vault_append",
-    "vault_delete",
-    "vault_list",
-    "vault_exists",
-    "vault_search",
-    "vault_grep",
-    "vault_get_metadata",
-    "vault_get_tags",
-    "vault_get_links",
-    "vault_get_backlinks",
-    "vault_write_canvas",
-    "canvas_critique_verdict",
-    "Persona",
-    "run_persona",
-]
+__all__: list[str] = []

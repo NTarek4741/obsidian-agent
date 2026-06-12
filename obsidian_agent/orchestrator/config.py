@@ -24,6 +24,14 @@ def _ensure_vault_path() -> str:
             return _ensure_agent_folder(resolved)
         print(f"Warning: Saved vault path does not exist: {resolved}")
 
+    # Headless contexts (uvicorn under systemd on a Dedalus machine) have no
+    # stdin to prompt — input() would raise EOFError and crash-loop the service.
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "OBSIDIAN_VAULT_PATH is not set or invalid and no terminal is "
+            "attached to prompt for it. Set it in the environment or .env."
+        )
+
     while True:
         vault = input("Enter the absolute path to your Obsidian vault: ").strip()
         if not vault:
@@ -56,10 +64,11 @@ def _ensure_agent_folder(vault_root: Path) -> str:
 
 
 def _load_api_key() -> str:
-    """Load DEDALUS_API_KEY from environment. Exit if missing."""
+    """Load DEDALUS_API_KEY from environment. Raise if missing."""
     load_dotenv()
     key = os.getenv("DEDALUS_API_KEY", "").strip()
     if not key:
-        print("Error: DEDALUS_API_KEY not found. Please set it in your .env file.")
-        sys.exit(1)
+        raise RuntimeError(
+            "DEDALUS_API_KEY not found. Please set it in your .env file."
+        )
     return key

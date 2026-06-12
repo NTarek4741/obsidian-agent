@@ -11,17 +11,21 @@ Endpoints:
         Response: audio/wav file (WAV podcast)
 
 Architecture:
-    A `DedalusRunner` agent drives the build with three Python tools that wrap
-    the Kokoro library calls available in this VM environment:
-      * synthesize_clip(text)       → writes a per-clip WAV, returns clip_path
-      * merge_clips(clip_paths)     → concatenates WAVs, returns wav_path
-      * deliver_podcast(wav_path)   → marks the final artifact
+    Script-first: a `DedalusRunner` agent writes the complete podcast script
+    as clean spoken prose, then makes exactly one tool call —
+      * generate_audio(script) → cleans the script, synthesizes the whole
+        thing with Kokoro (chunked internally on paragraph breaks), returns
+        the final wav_path.
+    TTS is deterministic post-processing of the agent's output; the agent
+    never loops over clips, so the job costs ~3 model steps instead of ~50.
     The single host voice is `af_bella`.
 """
 
 import os
+import re
 import tempfile
 import traceback
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -37,11 +41,12 @@ app = FastAPI()
 API_KEY = os.environ.get("DEDALUS_API_KEY", "")
 MODEL = "anthropic/claude-sonnet-4-20250514"
 
-PODCAST_SYSTEM_PROMPT = """SYSTEM_PROMPT_PLACEHOLDER"""
+# Deployed alongside this file by the machine.py bundle.
+PODCAST_SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text(encoding="utf-8")
 
 HOST_VOICE = "af_bella"
 SAMPLE_RATE = 24000
-MAX_AGENT_STEPS = 50
+MAX_AGENT_STEPS = 8  # script generation + one generate_audio call + retry headroom
 
 # Kokoro is heavy to initialise (loads weights). Build it lazily on the first
 # synthesis call so /health responds immediately after uvicorn starts —
@@ -97,82 +102,80 @@ def _synthesize_to_wav(text: str) -> tuple[str, float]:
     return wav_path, duration_s
 
 
-def _concat_wavs(wav_paths: list[str]) -> str:
-    """Concatenate WAV files (assumed same sample rate), return new WAV path."""
-    arrays = []
-    for p in wav_paths:
-        data, sr = sf.read(p, dtype="float32")
-        if sr != SAMPLE_RATE:
-            raise RuntimeError(f"Unexpected sample rate in {p}: {sr}")
-        arrays.append(data)
-    merged = np.concatenate(arrays) if arrays else np.zeros(0, dtype=np.float32)
-    out_path = tempfile.mktemp(suffix=".wav")
-    sf.write(out_path, merged, SAMPLE_RATE)
-    return out_path
+# ---------------------------------------------------------------------------
+# Script cleanup — deterministic defense-in-depth before TTS
+# ---------------------------------------------------------------------------
+
+# Square brackets are never spoken prose: [pause], [BEAT], [music swells]...
+_BRACKET_DIRECTION_RE = re.compile(r"\[[^\]]{0,60}\]")
+# Parentheses CAN carry spoken content ("(ICAO)"), so only strip known
+# stage-direction vocabulary.
+_PAREN_DIRECTION_RE = re.compile(
+    r"\((?:beat|pause[sd]?|laugh(?:s|ing|ter)?|chuckl\w*|sigh\w*|music[^)]*|"
+    r"sound[^)]*|sfx[^)]*)\)",
+    re.IGNORECASE,
+)
+# Speaker labels at line start: "Host:", "HOST —", "Narrator -"
+_SPEAKER_LABEL_RE = re.compile(
+    r"^\s*(?:host|narrator|speaker(?: \d+)?)\s*[:—–-]\s*", re.IGNORECASE | re.MULTILINE
+)
+# Markdown the TTS should never see: headings, emphasis, backticks
+_MARKDOWN_RE = re.compile(r"^#{1,6}\s+|[*_`]+", re.MULTILINE)
+
+
+def _clean_script(script: str) -> str:
+    """Strip anything that is not words the host says aloud.
+
+    The system prompt demands clean prose; this catches what slips through.
+    Paragraph breaks are preserved — they are the pacing unit (Kokoro splits
+    on newlines via split_pattern).
+    """
+    text = _BRACKET_DIRECTION_RE.sub("", script or "")
+    text = _PAREN_DIRECTION_RE.sub("", text)
+    text = _SPEAKER_LABEL_RE.sub("", text)
+    text = _MARKDOWN_RE.sub("", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
-# Agent tools — module-level, stateless. The endpoint recovers the final
-# wav path from runner.run()'s tool_results, so no shared state is needed.
+# Agent tool — the single deterministic post-processing step. The endpoint
+# recovers the final wav path from runner.run()'s tool_results.
 # ---------------------------------------------------------------------------
 
 
-def synthesize_clip(text: str) -> dict:
-    """Synthesise one chunk of the host's narration as a WAV file.
+def generate_audio(script: str) -> dict:
+    """Synthesise the complete podcast script into the final WAV.
 
-    Use 1-3 natural sentences per call. Do not include speaker labels,
-    stage directions, or pause markers — just the words to be spoken.
-    Returns the path to a WAV clip which must be passed to merge_clips.
+    Pass the FULL script as clean spoken prose: one paragraph per beat,
+    blank lines between beats, no speaker labels, stage directions, pause
+    markers, or markdown — only the words the host says aloud. Call this
+    exactly once; it returns the final wav_path and duration_s.
     """
-    text = (text or "").strip()
-    if not text:
-        return {"error": "text is empty"}
+    cleaned = _clean_script(script)
+    if not cleaned:
+        return {"error": "script is empty after cleanup"}
     try:
-        wav_path, duration_s = _synthesize_to_wav(text)
-        print(f"  synthesize_clip ({duration_s}s): {text[:80]!r}")
-        return {"clip_path": wav_path, "duration_s": duration_s}
-    except Exception as exc:
-        print(f"  synthesize_clip FAIL: {exc}")
-        return {"error": f"synth failed: {exc}"}
-
-
-def merge_clips(clip_paths: list[str]) -> dict:
-    """Concatenate the given WAV clips in order and produce one WAV file.
-
-    Pass the clip_path values returned by prior synthesize_clip calls,
-    in the order the listener should hear them. Returns the wav_path
-    which must be passed to deliver_podcast.
-    """
-    if not clip_paths:
-        return {"error": "clip_paths is empty"}
-    try:
-        wav_path = _concat_wavs(clip_paths)
+        wav_path, duration_s = _synthesize_to_wav(cleaned)
         size = os.path.getsize(wav_path)
-        print(f"  merge_clips: {len(clip_paths)} clips → {wav_path} ({size} bytes)")
-        return {"wav_path": wav_path, "bytes": size}
+        print(
+            f"  generate_audio: {len(cleaned)} chars → {wav_path} "
+            f"({duration_s}s, {size} bytes)"
+        )
+        return {"wav_path": wav_path, "duration_s": duration_s, "bytes": size}
     except Exception as exc:
-        print(f"  merge_clips FAIL: {exc}")
-        return {"error": f"merge failed: {exc}"}
+        print(f"  generate_audio FAIL: {exc}")
+        return {"error": f"synthesis failed: {exc}"}
 
 
-def deliver_podcast(wav_path: str) -> dict:
-    """Mark the WAV at wav_path as the final podcast to ship to the user.
-
-    Call this exactly once, after merge_clips has produced the WAV.
-    """
-    if not wav_path or not os.path.exists(wav_path):
-        return {"error": f"wav_path does not exist: {wav_path}"}
-    print(f"  deliver_podcast: {wav_path}")
-    return {"status": "ok", "wav_path": wav_path}
-
-
-TOOLS = [synthesize_clip, merge_clips, deliver_podcast]
+TOOLS = [generate_audio]
 
 
 def _extract_delivered_path(tool_results: list[dict]) -> str | None:
-    """Find the wav_path captured by the agent's deliver_podcast call."""
+    """Find the wav_path produced by the agent's generate_audio call."""
     for entry in tool_results:
-        if entry.get("name") != "deliver_podcast":
+        if entry.get("name") != "generate_audio":
             continue
         result = entry.get("result")
         if isinstance(result, dict) and "wav_path" in result:

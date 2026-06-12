@@ -10,11 +10,11 @@ ObsidianAgent treats your vault as the substrate for a small fleet of task-speci
 
 The architecture cleanly separates three concerns:
 
-1. **Personas** (`obsidian_agent/agent.py`) — declarative wrappers around a Dedalus runner: model, tools, MCP servers, optional JSON-schema output.
-2. **Orchestrators** (`obsidian_agent/orchestrator/<agent>/`) — multi-step pipelines that compose personas, MCPs, and vault tools to deliver a finished artefact (a note, a curriculum, a `.canvas`, a `.wav`, an `.apkg`).
-3. **Surfaces** — a FastAPI HTTP API (`api/app.py`) and an Ink-based TUI (`tui/`) that calls it.
+1. **Machine servers** (`obsidian_agent/orchestrator/<machine>/server_setup/`) — each of the three Dedalus VMs is described entirely by one self-contained folder: a `server.py` (the agents themselves — personas, prompts, pipelines, tools), its supporting modules, and a `setup.sh` that bootstraps the VM. Nothing agent-related runs locally.
+2. **Machines** (`obsidian_agent/machine.py`) — the single owner of the Dedalus VM lifecycle. All six agents execute on three persistent Dedalus machines: `podcast` (1 agent), `flashcard` (1 agent), and `utility` (transcription + fast research + deep research + mind map behind one FastAPI server). `machine.py` tars each machine's entire `server_setup/` directory into a deterministic bundle, finds/wakes/creates the VM, deploys the bundle, and keeps deployed files in sync via a content hash.
+3. **Surfaces** — a FastAPI HTTP API (`api/app.py`) that routes every agent endpoint through one dispatch table of thin async machine clients (`orchestrator/<machine>/client.py`), and an Ink-based TUI (`tui/`) that calls it.
 
-Long-running orchestrators (deep research, podcast, flashcard, transcription) execute on the backend and return a `job_id`; the TUI polls `/jobs/{job_id}` and renders progress live in its sidebar.
+Every agent request returns a `job_id`; the TUI polls `/jobs/{job_id}` and renders progress live in its sidebar. For the utility machine, jobs also run machine-side: the local API polls the machine's own `/jobs/{id}` endpoint, mirrors its progress lines into the local job, and writes the returned deliverables (new/changed vault files) into your local vault.
 
 ## Project Layout
 
@@ -25,22 +25,26 @@ ObsidianAgent/
 │   ├── app.py                       # FastAPI service: one endpoint per orchestrator + job polling
 │   └── utils.py                     # Job tracking, config helpers, shared request/response models
 ├── obsidian_agent/
-│   ├── agent.py                     # Persona class + run_persona() Dedalus runner
-│   ├── tools.py                     # Sandboxed vault tools (read/write/search/canvas/...)
+│   ├── machine.py                   # ALL Dedalus VM lifecycle: specs, registry, bundle deploy
+│   ├── machines.json                # Runtime registry of machine ids (gitignored)
 │   └── orchestrator/
-│       ├── utility.py               # API-key + vault-path resolution
-│       ├── transcription/           # File / YouTube / live mic → polished Obsidian note
-│       ├── fast_research/           # Topic → single wiki-style note with citations
-│       ├── deep_research/           # Topic → JSON curriculum plan → full folder build
-│       ├── mind_map/                # Note → radial .canvas mind map + learning path
+│       ├── __init__.py              # AGENT_CLIENTS dispatch table (agent kind → client fn)
+│       ├── config.py                # API-key + vault-path resolution (local side)
+│       ├── utility/                 # transcribe + fast/deep research + mind map, one VM
+│       │   ├── client.py            # Local client: upload inputs, poll jobs, apply deliverables
+│       │   └── server_setup/        # Self-contained bundle deployed to the utility VM
+│       │       ├── server.py        # FastAPI routes + all four agents (personas + jobs)
+│       │       ├── runner.py        # Persona class + run_persona() Dedalus runner
+│       │       ├── tools.py         # Sandboxed vault tools (read/write/search/canvas/...)
+│       │       ├── pipelines.py     # YouTube / audio-file transcript extraction
+│       │       ├── prompts/         # The agents' system prompts
+│       │       └── setup.sh         # VM bootstrap: venv, env file, systemd unit
 │       ├── podcast/                 # Note → .wav podcast (Dedalus VM)
-│       │   ├── orchestration.py
-│       │   ├── server_setup/        # server.py + setup.sh uploaded to the VM
-│       │   └── system_prompts/      # Persona prompts loaded at runtime
+│       │   ├── client.py            # Thin async client over machine.py
+│       │   └── server_setup/        # server.py + system_prompt.md + setup.sh
 │       └── flashcard/               # Note → Anki .apkg deck (Dedalus VM)
-│           ├── orchestration.py
-│           ├── server_setup/
-│           └── system_prompts/
+│           ├── client.py
+│           └── server_setup/
 └── tui/                             # Ink + React + TypeScript terminal UI
     ├── src/
     │   ├── components/              # App, Sidebar, Viewport, ConfigWizard, JobBox, ...
@@ -134,11 +138,13 @@ Note paths can be absolute or relative to the vault's `agent/` sandbox folder.
 
 ## The Agents
 
-Each agent is a `Persona` (or pair of personas) defined in `obsidian_agent/orchestrator/<agent>/orchestration.py`. Models and MCP servers are configured in code, not via env vars.
+Each agent is defined inside its machine's `server_setup/server.py`. Models and MCP servers are configured in code, not via env vars.
+
+The transcription, fast research, deep research, and mind map agents all run on the **utility machine** (1 vCPU / 2 GiB / 5 GiB) as one self-contained server: the four `Persona`s live directly in `utility/server_setup/server.py`, backed by sibling modules (`runner.py`, `tools.py`, `pipelines.py`, `prompts/`) that ship in the same bundle, running against a persistent machine-side vault at `/home/machine/vault`. The local API sends each job only the minimal input it needs (a topic string, the one source note, the one audio file), polls the machine's job endpoint while mirroring progress, and copies the resulting files back into your local vault. The machine vault is never cleaned up, so it accumulates a copy of all agent-generated content that later runs can read and search.
 
 ### Transcription Agent
 
-- **Pipeline:** auto-detects input — YouTube URL, local audio/video file, or raw bytes from the live microphone — runs the appropriate transcript extractor, then hands the timestamped transcript to a Dedalus persona that polishes it into a single Obsidian note.
+- **Pipeline:** auto-detects input — YouTube URL or local audio/video file (live microphone recordings are captured by the TUI and uploaded as files) — runs the appropriate transcript extractor, then hands the timestamped transcript to a Dedalus persona that polishes it into a single Obsidian note.
 - **Model:** `anthropic/claude-haiku-4-5-20251001`
 - **Output:** one markdown file with YAML frontmatter, timestamp-anchored sections, key takeaways, and a `## Sources` section citing the original.
 - **Endpoint:** `POST /transcribe` → `job_id`
@@ -169,10 +175,10 @@ Each agent is a `Persona` (or pair of personas) defined in `obsidian_agent/orche
 
 ### Podcast Agent
 
-- **Pipeline:** runs on a **persistent** Dedalus VM (2 vCPU / 4 GiB / 10 GiB) that survives across requests. The machine ID is pinned in `obsidian_agent/orchestrator/podcast/.machine_state.json` and Dedalus auto-sleeps the VM after 30 min of inactivity; no explicit teardown is performed. For each request the orchestrator:
-  1. Reuses the persisted machine — wakes it from snapshot if it's sleeping (can take up to ~15 min — Kokoro + venv weigh ~10 GB), or builds a fresh VM if the persisted ID is gone (first run: ~12 min provisioning, uploads `server.py` + `setup.sh`).
-  2. Reuses an existing `ready` HTTPS preview on port 8000 if one exists; otherwise opens a new one.
-  3. Health-checks the on-VM FastAPI server and relaunches `uvicorn` if it's not responding.
+- **Pipeline:** runs on a **persistent** Dedalus VM (2 vCPU / 4 GiB / 10 GiB) that survives across requests. The machine ID is pinned in `obsidian_agent/machines.json` and Dedalus auto-sleeps the VM after 30 min of inactivity; no explicit teardown is performed. For each request `machine.py`:
+  1. Reuses the persisted machine — wakes it from snapshot if it's sleeping (can take up to ~15 min — Kokoro + venv weigh ~10 GB), or builds a fresh VM if the persisted ID is gone (first run: ~12 min provisioning, deploys the `server_setup/` bundle).
+  2. Health-checks the on-VM venv and re-deploys the bundle (with a service restart) whenever the local bundle's sha256 differs from what was last deployed.
+  3. Reuses an existing `ready` HTTPS preview on port 8000 if one exists; otherwise opens a new one.
   4. POSTs the note content to `/generate-podcast`, with exponential-backoff retries on 5xx / connection errors.
   5. Saves the returned `.wav` to `<vault>/agent/podcasts/`.
 - **Endpoint:** `POST /podcast` → `job_id`
@@ -185,7 +191,7 @@ Each agent is a `Persona` (or pair of personas) defined in `obsidian_agent/orche
 
 ## Vault Tools
 
-All personas share a sandboxed filesystem toolset scoped to the configured vault. Paths are validated against directory traversal, symlinks, depth, and length; absolute paths are rejected.
+The utility-machine personas share a sandboxed filesystem toolset (`utility/server_setup/tools.py`) that executes on the machine, scoped to the machine vault's `agent/` folder. Paths are validated against directory traversal, symlinks, depth, and length; absolute paths are rejected.
 
 | Tool | Purpose |
 |------|---------|
@@ -222,7 +228,7 @@ The backend can be used standalone (without the TUI). Default base URL: `http://
 | `GET` | `/jobs/{job_id}` | — | `{status, progress[], result, error}` |
 | `DELETE` | `/machines` | — | Destroys any leftover Dedalus VMs |
 
-Jobs transition through `pending → running → done | failed`. Progress messages are captured from the orchestrator's stdout.
+Jobs transition through `pending → running → done | failed`. Every agent endpoint dispatches through the same `AGENT_CLIENTS` table to an async machine client that appends progress bullets to the job (utility jobs additionally mirror the machine's own job progress). Note: the mind-map job result carries `final_output` (a string) instead of the raw runner object.
 
 ## Configuration
 
@@ -232,14 +238,15 @@ Jobs transition through `pending → running → done | failed`. Progress messag
 | `OBSIDIAN_VAULT_PATH` | — | **Required.** Absolute path to your Obsidian vault |
 | `OBSIDIAN_AGENT_TIMEOUT` | `1800` | Dedalus runner timeout, in seconds |
 
-Models, MCP servers, and persona behaviour are configured per-agent inside `obsidian_agent/orchestrator/<agent>/orchestration.py`.
+Models, MCP servers, and persona behaviour are configured per-agent inside each machine's `server_setup/server.py`.
 
 ## Notes
 
 - **Vault sandbox.** Every tool call is path-validated against the vault root. Absolute paths, `..` traversal, symlinks, and over-long/over-deep paths are rejected at the tool level.
 - **Deep research determinism.** The planner uses strict JSON-schema output (`additionalProperties: false` injected recursively) so the executor always receives a well-typed plan.
 - **Mind-map fidelity.** The mind-map agent treats the source note as authoritative — web research only contributes sources and a learning path, never replacement content.
-- **VM hygiene.** Podcast and flashcard runs rely on Dedalus autosleep (30 min idle window) rather than per-request destroy. The machine ID is persisted in each orchestrator's `.machine_state.json` so warm reuse survives TUI restarts. `DELETE /machines` is a manual hard-reset that destroys every non-destroyed machine in the org — useful when a VM gets into a broken state or you want to force a fresh build.
+- **VM hygiene.** All three machines (podcast, flashcard, utility) rely on Dedalus autosleep (30 min idle window) rather than per-request destroy. Machine ids and deployed-bundle hashes are persisted in `obsidian_agent/machines.json` so warm reuse survives TUI restarts, and code changes to any `server_setup/` bundle auto-redeploy on the next request. `DELETE /machines` is a manual hard-reset that destroys every non-destroyed machine in the org — useful when a VM gets into a broken state or you want to force a fresh build.
+- **Utility machine vault.** The utility VM keeps its own vault at `/home/machine/vault` that persists across jobs and sleeps. Job inputs are uploaded into it, agent outputs are written to it, and only the files created/changed by a job are shipped back and merged into your local vault — your local vault remains the source of truth.
 - **Live recording.** The TUI uses a bundled `ffmpeg` to capture from the default input device, validates the file is non-empty, then uploads it through the same `/transcribe` endpoint as a file path.
 
 ## License
